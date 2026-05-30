@@ -1,0 +1,28 @@
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime data
+phase1_core_agent/data/*.sqlite3
+phase1_core_agent/data/model_switch_verification.json
+phase1_core_agent/data/ten_rally_demo*.json
+phase1_core_agent/data/ten_rally_demo*.md
+
+# Logs and local process files
+*.log
+*.pid
+
+# Editor state
+.idea/
+.vscode/
