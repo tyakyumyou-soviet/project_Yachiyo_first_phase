@@ -1,0 +1,24 @@
+# 2026-06-02 mobile/desktop responsive chat fix
+
+- Rebuilt `app_shell.html` so PC and mobile use the same DOM and only CSS changes the layout.
+- Kept the model selector visible on mobile by stacking header controls and making the selector full width under 720px.
+- Replaced the broken WebSocket send path in the page shell with HTTP streaming through `POST /chat`, avoiding a no-reaction button state while the socket is not open.
+- Verified JavaScript syntax with Node VM extraction: `script ok`.
+- Verified backend regression tests: `.venv\Scripts\python.exe -m unittest tests.test_phase1` -> 20 tests OK.
+- Restarted the server on `0.0.0.0:8000`; `/health` reports `qwen2.5:3b-instruct available` and active model `Qwen2.5 3B`.
+- Verified both `http://127.0.0.1:8000/` and `http://100.114.99.4:8000/` serve the fixed HTML.
+- Verified in the in-app browser at mobile width 390px: model selector visible, Send visible, tap sends the user bubble, clears the prompt, receives an assistant response, and returns to `ready`.
+- Static analysis found that direct `crypto.randomUUID()` can fail on non-secure external HTTP origins such as Tailscale IP access, while localhost often works. Added a `createSessionId()` fallback.
+- Wrapped session `localStorage` reads/writes so restricted mobile storage modes do not stop the whole page script.
+- Re-verified the served script on both localhost and Tailscale includes the external-safe session helpers.
+- Fixed unwanted replay of the previous `smartphone send test` session by removing the fallback that loaded the newest server session when the current browser session was missing.
+- Bumped the browser session storage key to `yachiyo-phase1-session-id-v2` so old saved test-session IDs are not reused.
+- Static analysis and server logs showed phone POST requests reached FastAPI with `200 OK`, so the `send failed: TypeError: Load failed` failure was likely client-side fetch streaming over external HTTP, not a missing route or unreachable server.
+- Added `POST /chat/complete` as a non-streaming JSON response path, and the external/Tailscale UI now uses it instead of fetch streaming.
+- Verified `POST http://100.114.99.4:8000/chat/complete` returns `200`, the requested session ID, and control packets.
+- Switched the runtime prompt to plain AI assistant mode at the user's request, removing Yachiyo character-profile injection from `prompt_builder.py`.
+- Replaced Yachiyo-specific fallback replies in `llm_engine.py` with neutral assistant fallback behavior.
+- Renamed the browser shell from `Yachiyo Chat` to `LLM Chat`.
+- Verified tests after the plain-mode switch: `.venv\Scripts\python.exe -m unittest tests.test_phase1` -> 22 tests OK.
+- Restarted the server on `0.0.0.0:8000`; `http://100.114.99.4:8000/` now serves the plain `LLM Chat` UI.
+- Verified a live `/chat/complete` response did not contain Yachiyo/Tsukuyomi character terms.

@@ -18,10 +18,34 @@ RESIDUAL_CONTROL_TAG_PATTERN = re.compile(
     r"<emotion\b[^>]*>.*?</emotion>|<motion>.*?</motion>|<thinking>.*?</thinking>|<plan>.*?</plan>|<tool\b[^>]*>.*?</tool>|</?(?:emotion|motion|thinking|plan|tool|arg)\b[^>]*>",
     re.DOTALL,
 )
+ENGLISH_STAGE_DIRECTION_PATTERN = re.compile(
+    r"\s*\((?=[^()\n]{3,180}\))(?=[^()\n]*[A-Za-z])[^()\n]*\)\s*"
+)
 
 
 def strip_residual_control_tags(text: str) -> str:
     return RESIDUAL_CONTROL_TAG_PATTERN.sub("", text)
+
+
+def strip_stage_directions(text: str) -> str:
+    cleaned = ENGLISH_STAGE_DIRECTION_PATTERN.sub(" ", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+    return cleaned.strip()
+
+
+def _incomplete_stage_direction_start(text: str) -> Optional[int]:
+    start = text.rfind("(")
+    if start == -1:
+        return None
+    if ")" in text[start:]:
+        return None
+    candidate = text[start + 1 :]
+    if "\n" in candidate or len(candidate) > 180:
+        return None
+    if not re.search(r"[A-Za-z]", candidate):
+        return None
+    return start
 
 
 class StreamParser:
@@ -48,6 +72,15 @@ class StreamParser:
                         packets.append(self._text_packet(prefix))
                         self.buffer = self.buffer[open_tag.start() :]
                     break
+
+                incomplete_stage_start = _incomplete_stage_direction_start(self.buffer)
+                if incomplete_stage_start is not None and not flush:
+                    prefix = self.buffer[:incomplete_stage_start]
+                    if prefix:
+                        packets.append(self._text_packet(prefix))
+                    self.buffer = self.buffer[incomplete_stage_start:]
+                    break
+
                 text = self.buffer
                 self.buffer = ""
                 if text:
@@ -139,4 +172,4 @@ class StreamParser:
         return True
 
     def _clean_visible_text(self, text: str) -> str:
-        return strip_residual_control_tags(text)
+        return strip_stage_directions(strip_residual_control_tags(text))

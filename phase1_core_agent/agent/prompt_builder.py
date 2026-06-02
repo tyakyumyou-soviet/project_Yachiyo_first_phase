@@ -6,7 +6,6 @@ from config import MAX_CHAT_HISTORY_MESSAGES, MAX_PROMPT_CHARS
 from model_manager import get_active_profile
 from schemas import ChatMessage
 
-from .character_profile import load_character_profile
 from .persona import SYSTEM_PROMPT_TEMPLATE
 
 
@@ -39,10 +38,8 @@ def build_messages(
     rag_memories: List[str],
 ) -> List[dict]:
     active_profile = get_active_profile()
-    character_profile = load_character_profile()
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         active_model_label=f"{active_profile['display_name']} ({active_profile['model_name']})",
-        character_profile=character_profile.content,
         tool_definitions=tool_definitions,
         rag_context=_render_rag_context(rag_memories),
         chat_history=_render_history(chat_history),

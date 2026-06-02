@@ -18,12 +18,13 @@ from agent.llm_engine import (
     generate_stream,
     ollama_healthcheck,
     ollama_installed_models,
+    user_visible_llm_failure_message,
     warmup_ollama,
 )
 from agent.character_profile import character_profile_stats
 from agent.memory_hub import MemoryHub
 from agent.prompt_builder import build_messages
-from agent.stream_parser import StreamParser, strip_residual_control_tags
+from agent.stream_parser import StreamParser, strip_residual_control_tags, strip_stage_directions
 from config import APP_HOST, APP_PORT, DATA_DIR, MAX_TOOL_ROUNDS, OLLAMA_WARMUP_ENABLED, TURN_STREAM_TIMEOUT_SECONDS
 from model_manager import get_active_profile, list_model_profiles, set_active_profile
 from schemas import (
@@ -618,19 +619,18 @@ async def stream_chat_turn(session: ChatSession, user_text: str) -> AsyncGenerat
                         tool_requests.extend(_collect_tool_requests(packet))
                         yield packet
             except asyncio.TimeoutError:
+                detail = f"Model response exceeded {TURN_STREAM_TIMEOUT_SECONDS:.0f}s."
                 yield _packet(
                     "system_status",
                     StatusPayload(
                         status="llm_timeout",
-                        detail=f"Model response exceeded {TURN_STREAM_TIMEOUT_SECONDS:.0f}s. Switching to fallback.",
+                        detail=detail,
                     ),
                 )
-                async for chunk in _generate_fallback(messages):
-                    for packet in parser.feed(chunk):
-                        if packet.event_type == "text_chunk" and isinstance(packet.payload, str):
-                            assistant_visible_text.append(packet.payload)
-                        tool_requests.extend(_collect_tool_requests(packet))
-                        yield packet
+                failure_text = user_visible_llm_failure_message(detail)
+                assistant_visible_text.append(failure_text)
+                yield _packet("text_chunk", failure_text)
+                break
 
             for packet in parser.flush():
                 if packet.event_type == "text_chunk" and isinstance(packet.payload, str):
@@ -651,9 +651,13 @@ async def stream_chat_turn(session: ChatSession, user_text: str) -> AsyncGenerat
                 StatusPayload(status="tool_loop_limit", detail="Tool loop limit reached."),
             )
     except LLMEngineError as exc:
-        yield _packet("system_status", StatusPayload(status="llm_error", detail=str(exc)))
+        detail = str(exc)
+        yield _packet("system_status", StatusPayload(status="llm_error", detail=detail))
+        failure_text = user_visible_llm_failure_message(detail)
+        assistant_visible_text.append(failure_text)
+        yield _packet("text_chunk", failure_text)
 
-    assistant_text = strip_residual_control_tags("".join(assistant_visible_text)).strip()
+    assistant_text = strip_stage_directions(strip_residual_control_tags("".join(assistant_visible_text))).strip()
     session.history.append(ChatMessage(role="user", content=user_text))
     if assistant_text:
         session.history.append(ChatMessage(role="assistant", content=assistant_text))
@@ -760,6 +764,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             yield f"data: {serialized}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/chat/complete")
+async def chat_complete(request: ChatRequest) -> JSONResponse:
+    session = session_store.get_or_create(request.session_id)
+    packets = []
+    async for packet in stream_chat_turn(session, request.text):
+        packets.append(packet.model_dump(mode="json"))
+    return JSONResponse({"packets": packets, "session_id": session.session_id})
 
 
 @app.websocket("/ws/chat")

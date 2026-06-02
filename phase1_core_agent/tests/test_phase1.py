@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -12,7 +13,7 @@ import main
 from agent import llm_engine
 from agent.memory_hub import MemoryHub
 from agent.prompt_builder import build_messages
-from agent.stream_parser import StreamParser
+from agent.stream_parser import StreamParser, strip_stage_directions
 from config import OLLAMA_FIRST_TOKEN_TIMEOUT_SECONDS, TURN_STREAM_TIMEOUT_SECONDS
 from main import SessionStore
 from tools import pc_control
@@ -34,7 +35,11 @@ class StreamParserTests(unittest.TestCase):
         packets = parser.feed("Hello </emotion> world")
         self.assertEqual(len(packets), 1)
         self.assertEqual(packets[0].event_type, "text_chunk")
-        self.assertEqual(packets[0].payload, "Hello  world")
+        self.assertEqual(packets[0].payload, "Hello world")
+
+    def test_parser_strips_english_stage_directions(self) -> None:
+        text = "(A slight, almost wistful sigh, a flicker of amusement in the eyes)\n\nヤチヨ、怖くない返事をするよ。"
+        self.assertEqual(strip_stage_directions(text), "ヤチヨ、怖くない返事をするよ。")
 
 
 class FallbackConversationTests(unittest.TestCase):
@@ -48,7 +53,8 @@ class FallbackConversationTests(unittest.TestCase):
             return "".join(chunks)
 
         result = asyncio.run(gather())
-        self.assertIn("月見ヤチヨ", result)
+        self.assertIn("通常のAIアシスタント", result)
+        self.assertNotIn("ヤチヨ", result)
         self.assertNotIn("Phase 1 の開発フォールバックで応答しているよ", result)
 
     def test_first_token_timeout_config_is_enabled(self) -> None:
@@ -57,7 +63,7 @@ class FallbackConversationTests(unittest.TestCase):
     def test_turn_stream_timeout_config_is_enabled(self) -> None:
         self.assertGreaterEqual(TURN_STREAM_TIMEOUT_SECONDS, 5.0)
 
-    def test_yachiyo_fallback_handles_casual_topics(self) -> None:
+    def test_plain_fallback_handles_casual_topics(self) -> None:
         async def gather(text: str) -> str:
             chunks = []
             async for chunk in llm_engine._generate_fallback([{"role": "user", "content": text}]):
@@ -65,21 +71,50 @@ class FallbackConversationTests(unittest.TestCase):
             return "".join(chunks)
 
         picnic = asyncio.run(gather("今度ピクニックいくんだー"))
-        self.assertIn("おとぎ話", picnic)
-        self.assertIn("パンケーキ", picnic)
+        self.assertTrue(picnic.strip())
+        self.assertNotIn("ヤチヨ", picnic)
 
         phone = asyncio.run(gather("スマホ壊れちゃった"))
-        self.assertIn("よしよし", phone)
-        self.assertIn("再起動", phone)
+        self.assertTrue(phone.strip())
+        self.assertNotIn("ヤチヨ", phone)
 
-    def test_short_casual_topics_are_handled_before_model(self) -> None:
+    def test_short_casual_topics_are_not_intercepted_before_model(self) -> None:
         reply = llm_engine._yachiyo_short_reply([{"role": "user", "content": "うんちしたい"}])
-        self.assertIsNotNone(reply)
-        self.assertIn("運命の日", reply or "")
+        self.assertIsNone(reply)
 
         reply = llm_engine._yachiyo_short_reply([{"role": "user", "content": "スマホ壊れちゃった"}])
-        self.assertIsNotNone(reply)
-        self.assertIn("再起動", reply or "")
+        self.assertIsNone(reply)
+
+
+    def test_generate_stream_uses_model_for_normal_short_chat(self) -> None:
+        async def fake_ollama(_messages):
+            yield "こんにちは。今日はちゃんと会話の流れに合わせて話すよ。"
+
+        async def gather() -> str:
+            chunks = []
+            with patch.object(llm_engine, "_generate_from_ollama", fake_ollama):
+                async for chunk in llm_engine.generate_stream([{"role": "user", "content": "こんにちは"}]):
+                    chunks.append(chunk)
+            return "".join(chunks)
+
+        result = asyncio.run(gather())
+        self.assertEqual(result, "こんにちは。今日はちゃんと会話の流れに合わせて話すよ。")
+
+    def test_ollama_failure_does_not_use_canned_fallback(self) -> None:
+        async def broken_ollama(_messages):
+            raise RuntimeError("forced failure")
+            yield ""  # pragma: no cover
+
+        async def gather() -> str:
+            chunks = []
+            with patch.object(llm_engine, "_generate_from_ollama", broken_ollama):
+                with self.assertRaises(llm_engine.LLMEngineError):
+                    async for chunk in llm_engine.generate_stream([{"role": "user", "content": "うっす"}]):
+                        chunks.append(chunk)
+            return "".join(chunks)
+
+        result = asyncio.run(gather())
+        self.assertEqual(result, "")
 
 
 class MemoryHubTests(unittest.TestCase):
@@ -93,7 +128,7 @@ class MemoryHubTests(unittest.TestCase):
 
 
 class PromptBuilderTests(unittest.TestCase):
-    def test_character_profile_is_injected_into_system_prompt(self) -> None:
+    def test_system_prompt_uses_plain_assistant_mode(self) -> None:
         messages = build_messages(
             user_text="こんにちは",
             chat_history=[],
@@ -101,11 +136,12 @@ class PromptBuilderTests(unittest.TestCase):
             rag_memories=[],
         )
         system_prompt = messages[0]["content"]
-        self.assertIn("Character profile:", system_prompt)
-        self.assertIn("月見ヤチヨ Features", system_prompt)
-        self.assertIn("ツクヨミの管理人", system_prompt)
-        self.assertIn("Yachiyo voice anchor:", system_prompt)
-        self.assertIn("Situation patterns:", system_prompt)
+        self.assertIn("通常のAIアシスタント", system_prompt)
+        self.assertIn("キャラクター、ロールプレイ、演技", system_prompt)
+        self.assertIn("固有キャラクター設定を使わない", system_prompt)
+        self.assertNotIn("Character profile:", system_prompt)
+        self.assertNotIn("月見ヤチヨ Features", system_prompt)
+        self.assertNotIn("ツクヨミの管理人", system_prompt)
 
 
 class FileToolTests(unittest.TestCase):
@@ -159,12 +195,14 @@ class ApiTests(unittest.TestCase):
     def test_root_page_exists(self) -> None:
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Yachiyo", response.text)
+        self.assertIn("LLM Chat", response.text)
         self.assertIn("/ws/chat", response.text)
-        self.assertIn("Yachiyo Chat", response.text)
+        self.assertNotIn("Yachiyo Chat", response.text)
         self.assertIn("メッセージを送信", response.text)
-        self.assertIn("loadLatestHistory()", response.text)
+        self.assertIn("loadCurrentHistory()", response.text)
+        self.assertNotIn("sessions[sessions.length - 1]", response.text)
         self.assertIn("/models/select", response.text)
+        self.assertIn("/chat/complete", response.text)
 
     def test_chat_endpoint_streams_tool_loop(self) -> None:
         response = self.client.post("/chat", json={"text": "time please", "session_id": "test-session"})
@@ -174,6 +212,16 @@ class ApiTests(unittest.TestCase):
         self.assertIn('"event_type": "tool_pending"', body)
         self.assertIn('"event_type": "tool_result"', body)
         self.assertIn("get_current_time", body)
+
+    def test_chat_complete_endpoint_returns_packets(self) -> None:
+        response = self.client.post("/chat/complete", json={"text": "time please", "session_id": "complete-session"})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["session_id"], "complete-session")
+        event_types = [packet["event_type"] for packet in body["packets"]]
+        self.assertIn("system_status", event_types)
+        self.assertIn("tool_pending", event_types)
+        self.assertIn("tool_result", event_types)
 
     def test_sessions_endpoint_reports_active_session(self) -> None:
         self.client.post("/chat", json={"text": "hello", "session_id": "alpha"})
