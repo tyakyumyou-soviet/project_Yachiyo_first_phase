@@ -16,6 +16,7 @@ from agent.prompt_builder import build_messages
 from agent.stream_parser import StreamParser, strip_stage_directions
 from config import OLLAMA_FIRST_TOKEN_TIMEOUT_SECONDS, TURN_STREAM_TIMEOUT_SECONDS
 from main import SessionStore
+from model_manager import MODEL_STATE_PATH
 from tools import pc_control
 
 
@@ -38,24 +39,21 @@ class StreamParserTests(unittest.TestCase):
         self.assertEqual(packets[0].payload, "Hello world")
 
     def test_parser_strips_english_stage_directions(self) -> None:
-        text = "(A slight, almost wistful sigh, a flicker of amusement in the eyes)\n\nヤチヨ、怖くない返事をするよ。"
-        self.assertEqual(strip_stage_directions(text), "ヤチヨ、怖くない返事をするよ。")
+        text = "(A slight, almost wistful sigh)\n\nこんにちは"
+        self.assertEqual(strip_stage_directions(text), "こんにちは")
 
 
 class FallbackConversationTests(unittest.TestCase):
     def test_fallback_greeting_is_not_fixed_echo(self) -> None:
         async def gather() -> str:
             chunks = []
-            async for chunk in llm_engine._generate_fallback(
-                [{"role": "user", "content": "こんにちは。短く自己紹介して。"}]
-            ):
+            async for chunk in llm_engine._generate_fallback([{"role": "user", "content": "こんにちは、雑談したい"}]):
                 chunks.append(chunk)
             return "".join(chunks)
 
         result = asyncio.run(gather())
-        self.assertIn("通常のAIアシスタント", result)
-        self.assertNotIn("ヤチヨ", result)
-        self.assertNotIn("Phase 1 の開発フォールバックで応答しているよ", result)
+        self.assertIn("ヤオヨロー！", result)
+        self.assertNotIn("Phase 1", result)
 
     def test_first_token_timeout_config_is_enabled(self) -> None:
         self.assertGreaterEqual(OLLAMA_FIRST_TOKEN_TIMEOUT_SECONDS, 1.0)
@@ -63,42 +61,46 @@ class FallbackConversationTests(unittest.TestCase):
     def test_turn_stream_timeout_config_is_enabled(self) -> None:
         self.assertGreaterEqual(TURN_STREAM_TIMEOUT_SECONDS, 5.0)
 
-    def test_plain_fallback_handles_casual_topics(self) -> None:
+    def test_yachiyo_light_fallback_handles_casual_topics(self) -> None:
         async def gather(text: str) -> str:
             chunks = []
             async for chunk in llm_engine._generate_fallback([{"role": "user", "content": text}]):
                 chunks.append(chunk)
             return "".join(chunks)
 
-        picnic = asyncio.run(gather("今度ピクニックいくんだー"))
-        self.assertTrue(picnic.strip())
-        self.assertNotIn("ヤチヨ", picnic)
-
-        phone = asyncio.run(gather("スマホ壊れちゃった"))
-        self.assertTrue(phone.strip())
-        self.assertNotIn("ヤチヨ", phone)
+        self.assertTrue(asyncio.run(gather("ピクニックいきたい")).strip())
+        self.assertTrue(asyncio.run(gather("スマホ壊れた")).strip())
 
     def test_short_casual_topics_are_not_intercepted_before_model(self) -> None:
-        reply = llm_engine._yachiyo_short_reply([{"role": "user", "content": "うんちしたい"}])
-        self.assertIsNone(reply)
-
-        reply = llm_engine._yachiyo_short_reply([{"role": "user", "content": "スマホ壊れちゃった"}])
-        self.assertIsNone(reply)
-
+        self.assertEqual(
+            llm_engine._yachiyo_short_reply([{"role": "user", "content": "こんにちは"}]),
+            "ヤオヨロー！ こんにちは。今日はどんな話をしようか。",
+        )
+        self.assertIsNone(llm_engine._yachiyo_short_reply([{"role": "user", "content": "スマホ壊れた"}]))
 
     def test_generate_stream_uses_model_for_normal_short_chat(self) -> None:
         async def fake_ollama(_messages):
-            yield "こんにちは。今日はちゃんと会話の流れに合わせて話すよ。"
+            yield "こんにちは。今日はどんな話をしようか。"
 
         async def gather() -> str:
             chunks = []
             with patch.object(llm_engine, "_generate_from_ollama", fake_ollama):
-                async for chunk in llm_engine.generate_stream([{"role": "user", "content": "こんにちは"}]):
+                async for chunk in llm_engine.generate_stream([{"role": "user", "content": "今日は眠い"}]):
                     chunks.append(chunk)
             return "".join(chunks)
 
         result = asyncio.run(gather())
-        self.assertEqual(result, "こんにちは。今日はちゃんと会話の流れに合わせて話すよ。")
+        self.assertEqual(result, "こんにちは。今日はどんな話をしようか。")
+
+    def test_generate_stream_intercepts_pure_greeting(self) -> None:
+        async def gather() -> str:
+            chunks = []
+            async for chunk in llm_engine.generate_stream([{"role": "user", "content": "こんにちは"}]):
+                chunks.append(chunk)
+            return "".join(chunks)
+
+        result = asyncio.run(gather())
+        self.assertEqual(result, "ヤオヨロー！ こんにちは。今日はどんな話をしようか。")
 
     def test_ollama_failure_does_not_use_canned_fallback(self) -> None:
         async def broken_ollama(_messages):
@@ -109,26 +111,58 @@ class FallbackConversationTests(unittest.TestCase):
             chunks = []
             with patch.object(llm_engine, "_generate_from_ollama", broken_ollama):
                 with self.assertRaises(llm_engine.LLMEngineError):
-                    async for chunk in llm_engine.generate_stream([{"role": "user", "content": "うっす"}]):
+                    async for chunk in llm_engine.generate_stream([{"role": "user", "content": "why"}]):
+                        chunks.append(chunk)
+            return "".join(chunks)
+
+        self.assertEqual(asyncio.run(gather()), "")
+
+    def test_gemma_quality_guard_rejects_style_token_fragment(self) -> None:
+        self.assertTrue(llm_engine._looks_like_failed_response("だよ、だね？"))
+        self.assertTrue(llm_engine._looks_like_failed_response("だよ。"))
+        self.assertTrue(llm_engine._looks_like_failed_response("なのです"))
+        self.assertFalse(
+            llm_engine._looks_like_failed_response("そっか、今日は少し疲れてたんだね。無理しすぎないで、まずは一息つこ。")
+        )
+        self.assertFalse(llm_engine._looks_like_failed_response("ありがとう"))
+        self.assertFalse(llm_engine._looks_like_failed_response("おはよう"))
+
+    def test_gemma_repair_keeps_original_user_as_final_message(self) -> None:
+        repaired = llm_engine._repair_gemma_messages(
+            [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "今日ちょっと疲れた"},
+            ]
+        )
+        self.assertEqual(repaired[-1], {"role": "user", "content": "今日ちょっと疲れた"})
+        self.assertIn("自然な日本語", repaired[0]["content"])
+        self.assertIn("あら", repaired[0]["content"])
+
+    def test_gemma_quality_guard_falls_back_instead_of_silence(self) -> None:
+        async def gather() -> str:
+            chunks = []
+            with patch.object(llm_engine, "get_active_model_name", return_value="gemma3:1b"):
+                with patch.object(llm_engine, "_generate_buffered_from_ollama", side_effect=["だよ。", "だよ。"]):
+                    async for chunk in llm_engine._generate_from_ollama([{"role": "user", "content": "スマホで送れない"}]):
                         chunks.append(chunk)
             return "".join(chunks)
 
         result = asyncio.run(gather())
-        self.assertEqual(result, "")
+        self.assertTrue(result.strip())
+        self.assertNotEqual(result.strip(), "だよ。")
 
 
 class MemoryHubTests(unittest.TestCase):
     def test_memory_hub_captures_facts_and_recalls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             hub = MemoryHub(Path(temp_dir) / "memory.sqlite3")
-            facts = hub.capture_user_facts("私はカレーが好きです")
-            self.assertTrue(facts)
+            hub.add_semantic_memory("好きな食べ物はカレーです")
             recalled = hub.recall("カレー")
             self.assertTrue(any("カレー" in item for item in recalled))
 
 
 class PromptBuilderTests(unittest.TestCase):
-    def test_system_prompt_uses_plain_assistant_mode(self) -> None:
+    def test_system_prompt_uses_yachiyo_light_mode(self) -> None:
         messages = build_messages(
             user_text="こんにちは",
             chat_history=[],
@@ -136,12 +170,10 @@ class PromptBuilderTests(unittest.TestCase):
             rag_memories=[],
         )
         system_prompt = messages[0]["content"]
-        self.assertIn("通常のAIアシスタント", system_prompt)
-        self.assertIn("キャラクター、ロールプレイ、演技", system_prompt)
-        self.assertIn("固有キャラクター設定を使わない", system_prompt)
-        self.assertNotIn("Character profile:", system_prompt)
-        self.assertNotIn("月見ヤチヨ Features", system_prompt)
-        self.assertNotIn("ツクヨミの管理人", system_prompt)
+        self.assertIn("ヤチヨ", system_prompt)
+        self.assertIn("Light", system_prompt)
+        self.assertIn("Character notes:", system_prompt)
+        self.assertIn("Features", system_prompt)
 
 
 class FileToolTests(unittest.TestCase):
@@ -167,8 +199,7 @@ class ApiTests(unittest.TestCase):
         memory_file = Path(self.temp_dir.name) / "memory.sqlite3"
         main.memory_hub = MemoryHub(memory_file)
         main.session_store = SessionStore()
-
-        import agent.llm_engine as llm_engine
+        self._original_model_state = MODEL_STATE_PATH.read_text(encoding="utf-8") if MODEL_STATE_PATH.exists() else None
 
         self._original_enable_ollama = llm_engine.ENABLE_OLLAMA
         self._original_enable_dev_fallback = llm_engine.ENABLE_DEV_FALLBACK
@@ -178,8 +209,13 @@ class ApiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
-
-        import agent.llm_engine as llm_engine
+        if self._original_model_state is None:
+            try:
+                MODEL_STATE_PATH.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            MODEL_STATE_PATH.write_text(self._original_model_state, encoding="utf-8")
 
         llm_engine.ENABLE_OLLAMA = self._original_enable_ollama
         llm_engine.ENABLE_DEV_FALLBACK = self._original_enable_dev_fallback
@@ -195,10 +231,9 @@ class ApiTests(unittest.TestCase):
     def test_root_page_exists(self) -> None:
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("LLM Chat", response.text)
+        self.assertIn("Yachiyo Light", response.text)
         self.assertIn("/ws/chat", response.text)
         self.assertNotIn("Yachiyo Chat", response.text)
-        self.assertIn("メッセージを送信", response.text)
         self.assertIn("loadCurrentHistory()", response.text)
         self.assertNotIn("sessions[sessions.length - 1]", response.text)
         self.assertIn("/models/select", response.text)

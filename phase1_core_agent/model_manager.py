@@ -31,6 +31,13 @@ MODEL_PROFILES: List[Dict[str, str]] = [
         "description": "Very light model for quickest local responses.",
         "size_label": "815 MB",
     },
+    {
+        "id": "gemma4_e2b",
+        "model_name": "gemma4:e2b",
+        "display_name": "Gemma 4 E2B",
+        "description": "Compact Gemma 4 profile for stronger local text chat and reasoning.",
+        "size_label": "7.2 GB",
+    },
 ]
 
 DEFAULT_MODEL_ID = "gemma3_1b"

@@ -6,6 +6,7 @@ from config import MAX_CHAT_HISTORY_MESSAGES, MAX_PROMPT_CHARS
 from model_manager import get_active_profile
 from schemas import ChatMessage
 
+from .character_profile import load_character_profile
 from .persona import SYSTEM_PROMPT_TEMPLATE
 
 
@@ -30,6 +31,23 @@ def _render_rag_context(memories: List[str]) -> str:
     return _truncate_text(rendered, MAX_PROMPT_CHARS // 4)
 
 
+def _render_character_profile(model_name: str) -> str:
+    snapshot = load_character_profile()
+    if not snapshot.loaded:
+        return snapshot.content
+
+    if model_name == "gemma3:1b":
+        limit = 700
+    elif model_name == "gemma4:e2b":
+        limit = 1400
+    else:
+        limit = 2200
+
+    lines = [line.strip() for line in snapshot.content.splitlines() if line.strip()]
+    condensed = "\n".join(f"- {line}" for line in lines[:18])
+    return _truncate_text(condensed, limit)
+
+
 def build_messages(
     *,
     user_text: str,
@@ -40,6 +58,7 @@ def build_messages(
     active_profile = get_active_profile()
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         active_model_label=f"{active_profile['display_name']} ({active_profile['model_name']})",
+        character_profile=_render_character_profile(active_profile["model_name"]),
         tool_definitions=tool_definitions,
         rag_context=_render_rag_context(rag_memories),
         chat_history=_render_history(chat_history),

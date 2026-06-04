@@ -29,13 +29,18 @@ class LLMEngineError(RuntimeError):
 def user_visible_llm_failure_message(detail: str) -> str:
     active_model = get_active_model_name()
     return (
-        "モデルの応答を待ちましたが、今回は返答を作れませんでした。"
-        f"現在のモデルは {active_model} です。"
+        "モデルの応答を取得できませんでした。少し待ってからもう一度送ってください。\n"
+        f"現在のモデル: {active_model}\n"
         f"詳細: {detail}"
     )
 
 
 async def generate_stream(messages: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
+    short_reply = _yachiyo_short_reply(messages)
+    if short_reply is not None:
+        yield short_reply
+        return
+
     if ENABLE_OLLAMA:
         try:
             async for chunk in _generate_from_ollama(messages):
@@ -80,6 +85,10 @@ async def _generate_from_ollama(messages: List[Dict[str, str]]) -> AsyncGenerato
 
     if active_model == "gemma3:1b":
         text = await _generate_buffered_from_ollama(active_model, messages)
+        if _looks_like_failed_response(text):
+            text = await _generate_buffered_from_ollama(active_model, _repair_gemma_messages(messages))
+        if _looks_like_failed_response(text):
+            text = _fallback_conversation(messages)
         if _looks_like_failed_response(text):
             raise LLMEngineError("Gemma response failed quality guard")
         for chunk in _chunk_text(text):
@@ -181,15 +190,68 @@ def _looks_like_failed_response(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return True
+
+    normalized = re.sub(r"\s+", "", stripped)
+    bad_tokens = {
+        "だよ。",
+        "だよ",
+        "だね。",
+        "だね",
+        "かな。",
+        "かな",
+        "よ。",
+        "よ",
+        "だよ、だね？",
+        "だよ、だね",
+        "なのです",
+    }
+    if normalized in bad_tokens:
+        return True
+    if len(stripped) <= 3 and not any(char in stripped for char in "。！？!?"):
+        return True
     if stripped.count("...") >= 4 or stripped.count("…") >= 6:
         return True
     if len(stripped) > 900:
         return True
-    bad_fragments = ("ヤチヨ…", "まだ、歌", "歌うべき", "(A slight", "(smiles")
+    bad_fragments = ("ヤチヨ…", "まだ歌を歌うべき", "(A slight", "(smiles")
     return any(fragment in stripped for fragment in bad_fragments)
 
 
+def _repair_gemma_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    system_content = next((message.get("content", "") for message in messages if message.get("role") == "system"), "")
+    user_content = next(
+        (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+        "",
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{system_content}\n\n"
+                "重要: 直前のユーザー発言へ、自然な日本語で1〜2文だけ返す。"
+                "単語だけ、語尾だけ、ルール説明、ト書き、独白は禁止。"
+                "「あら」で始めない。"
+            ),
+        },
+        {"role": "user", "content": user_content},
+    ]
+
+
 def _yachiyo_short_reply(messages: List[Dict[str, str]]) -> str | None:
+    user_text = messages[-1]["content"].strip() if messages else ""
+    normalized = re.sub(r"\s+", "", user_text.lower())
+    greeting_tokens = {
+        "こんにちは",
+        "こんばんは",
+        "おはよう",
+        "やあ",
+        "うっす",
+        "hello",
+        "hi",
+        "hey",
+    }
+    if normalized in greeting_tokens:
+        return "ヤオヨロー！ こんにちは。今日はどんな話をしようか。"
     return None
 
 
@@ -203,11 +265,11 @@ async def _generate_fallback(messages: List[Dict[str, str]]) -> AsyncGenerator[s
 
     lowered = user_text.lower()
     if "time" in lowered or "時刻" in user_text or "時間" in user_text:
-        yield "<tool name=\"get_current_time\"></tool>"
+        yield '<tool name="get_current_time"></tool>'
         return
 
     if "list" in lowered or "一覧" in user_text:
-        yield "<tool name=\"list_directory\"><arg name=\"path\">.</arg></tool>"
+        yield '<tool name="list_directory"><arg name="path">.</arg></tool>'
         return
 
     yield _fallback_conversation(messages)
@@ -217,7 +279,7 @@ def _tool_result_reply(latest: str) -> str:
     cleaned = latest.strip()
     if len(cleaned) > 260:
         cleaned = cleaned[:257] + "..."
-    return f"確認できた結果は次の通りです: {cleaned}"
+    return f"確認できた内容は次の通りです: {cleaned}"
 
 
 def _extract_user_facts(messages: List[Dict[str, str]]) -> Dict[str, str]:
@@ -227,8 +289,8 @@ def _extract_user_facts(messages: List[Dict[str, str]]) -> Dict[str, str]:
             continue
         text = message.get("content", "")
         for pattern in (
-            r"(?:私の名前は|名前は|i am|i'm|my name is)\s*([A-Za-z0-9_\-\u3040-\u30ff\u4e00-\u9fff]+)",
-            r"(?:私は|ぼくは|僕は|俺は)\s*([A-Za-z0-9_\-\u3040-\u30ff\u4e00-\u9fff]+)\s*です",
+            r"(?:名前は|僕は|私は|i am|i'm|my name is)\s*([A-Za-z0-9_\-\u3040-\u30ff\u4e00-\u9fff]+)",
+            r"(?:俺は|ぼくは|君は)\s*([A-Za-z0-9_\-\u3040-\u30ff\u4e00-\u9fff]+)\s*です",
         ):
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
@@ -242,27 +304,27 @@ def _fallback_conversation(messages: List[Dict[str, str]]) -> str:
     facts = _extract_user_facts(messages)
     name = facts.get("name")
 
-    if any(keyword in lowered for keyword in ("自己紹介", "introduce yourself", "who are you", "あなたは誰")):
-        return "私は通常のAIアシスタントです。質問への回答、調査、文章整理、コード作業の手伝いができます。"
+    if any(keyword in lowered for keyword in ("introduce yourself", "who are you", "あなたは誰")):
+        return "ヤチヨだよ。気になることがあれば、そのまま話して。ちゃんと受け止めるから。"
 
-    if any(keyword in lowered for keyword in ("remember", "覚えて", "覚えておいて")) and name:
-        return f"わかりました。あなたの名前は{name}さんとして覚えておきます。"
+    if any(keyword in lowered for keyword in ("remember", "覚えて")) and name:
+        return f"うん、覚えておくね。あなたの名前は{name}さん。"
 
-    if any(keyword in lowered for keyword in ("what is my name", "私の名前", "ぼくの名前", "僕の名前", "俺の名前", "名前は何")):
+    if any(keyword in lowered for keyword in ("what is my name", "名前", "ぼくの名前", "僕の名前", "俺の名前")):
         if name:
-            return f"あなたの名前は{name}さんです。"
-        return "まだ名前は把握できていません。教えてくれたら、その会話の中で使います。"
+            return f"あなたの名前は{name}さんだよ。"
+        return "まだ名前は聞けていないよ。よければ教えて。"
 
-    if any(keyword in lowered for keyword in ("phase 1", "backend", "強み")):
-        return "Phase 1の強みは、ローカルLLM、会話API、ツール実行、記憶機能をひとつのバックエンドで試せるところです。"
+    if any(keyword in lowered for keyword in ("phase 1", "backend", "仕組み")):
+        return "Phase 1 は、ローカルLLMと会話API、それからツール実行をまとめた最小構成として動いているよ。"
 
     if any(keyword in lowered for keyword in ("local-first", "ローカル")):
-        return "ローカル実行の利点は、応答やデータの扱いを自分の環境内で制御しやすいことです。"
+        return "ローカル中心に動くと、応答やデータの扱いを自分で管理しやすいのが強みだね。"
 
     if any(keyword in lowered for keyword in ("こんにちは", "hello", "hi", "こんばんは", "おはよう")):
-        return "こんにちは。普通のAIアシスタントとして返答します。何について話しましょうか？"
+        return "ヤオヨロー！ こんにちは。今日はどんな話をしようか。"
 
     if len(user_text.strip()) <= 18:
-        return f"「{user_text.strip()}」について、もう少し詳しく聞かせてください。"
+        return f"{user_text.strip()}、なんだね。もう少しだけ聞けたら、ちゃんと一緒に考えられるよ。"
 
-    return "内容は受け取りました。必要なら、要点整理・原因調査・次の対応案のどれからでも手伝えます。"
+    return "続けて大丈夫だよ。いま気になっているところから、一つずつ一緒に見ていこう。"

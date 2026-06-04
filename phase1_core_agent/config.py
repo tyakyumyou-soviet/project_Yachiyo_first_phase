@@ -10,7 +10,7 @@ PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_HOST = os.getenv("YACHIYO_HOST", "127.0.0.1")
+APP_HOST = os.getenv("YACHIYO_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("YACHIYO_PORT", "8000"))
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -33,7 +33,7 @@ MAX_CHAT_HISTORY_MESSAGES = int(os.getenv("MAX_CHAT_HISTORY_MESSAGES", "20"))
 MAX_RAG_ITEMS = int(os.getenv("MAX_RAG_ITEMS", "3"))
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "20000"))
 CHARACTER_PROFILE_PATH = Path(
-    os.getenv("YACHIYO_CHARACTER_PROFILE", str(BASE_DIR / "Features_yachiyo.txt"))
+    os.getenv("YACHIYO_CHARACTER_PROFILE", str(BASE_DIR / "yachiyo_spirit" / "Features_yachiyo.txt"))
 )
 MAX_CHARACTER_PROFILE_CHARS = int(os.getenv("MAX_CHARACTER_PROFILE_CHARS", "12000"))
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "3"))

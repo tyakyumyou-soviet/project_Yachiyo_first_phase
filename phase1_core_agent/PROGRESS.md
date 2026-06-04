@@ -128,3 +128,21 @@ Phase 1 を単体で運用・検証しやすい形まで実装済み。SSE、Web
 - Phase 2 UI との WebSocket 契約テストを追加
 - 記憶検索のスコアリング強化
 - `search_web` の要約品質と耐障害性の強化
+
+## 2026-06-03 Yachiyo Light プロンプト初版
+
+- `yachiyo_spirit/` に人格設計資料、抽出ガイド、評価セット、実プロンプト初版を追加
+- `agent/persona.py` を通常AIモードから `Yachiyo Light` 用の短い実行プロンプトへ変更
+- `app_shell.html` の表示名を `Yachiyo Light` に変更
+- `config.py` の既定ホストを `0.0.0.0` に変更し、Tailscaleアクセス時も起動しやすくした
+- `Features_yachiyo.txt` の既定参照先を `yachiyo_spirit/Features_yachiyo.txt` に変更
+- Gemma 1B の語尾断片出力を検知し、1回だけ修復再生成する品質ガードを追加
+- テストが `/models/select` 後に `data/model_state.json` を汚さないよう、モデル状態の復元処理を追加
+- `.venv\Scripts\python.exe -m unittest tests.test_phase1` で 24 件成功
+- 実測では Gemma 1B は文脈追従が弱く、Qwen2.5 3B のほうが Yachiyo Light の会話品質が安定したため、現在のアクティブモデルは `qwen25_3b`
+
+## 2026-06-03 Gemma 4 E2B 追加
+
+- Ollama の正式タグ `gemma4:e2b` を確認
+- `model_manager.py` のプロファイル一覧へ `Gemma 4 E2B` を追加
+- `README.md` の導入手順と利用可能モデル一覧へ `gemma4:e2b` を追記

@@ -29,6 +29,7 @@ Optional Ollama setup:
 ollama pull qwen3-vl:8b
 ollama pull qwen2.5:3b-instruct
 ollama pull gemma3:1b
+ollama pull gemma4:e2b
 ```
 
 Available runtime profiles:
@@ -36,6 +37,7 @@ Available runtime profiles:
 - `Qwen3-VL 8B` -> `qwen3-vl:8b`
 - `Qwen2.5 3B` -> `qwen2.5:3b-instruct`
 - `Gemma 3 1B` -> `gemma3:1b`
+- `Gemma 4 E2B` -> `gemma4:e2b`
 
 ## Run
 
