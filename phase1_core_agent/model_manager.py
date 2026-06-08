@@ -11,20 +11,6 @@ MODEL_STATE_PATH = DATA_DIR / "model_state.json"
 
 MODEL_PROFILES: List[Dict[str, str]] = [
     {
-        "id": "qwen3_vl_8b",
-        "model_name": "qwen3-vl:8b",
-        "display_name": "Qwen3-VL 8B",
-        "description": "Main vision-capable model. Highest quality, heaviest runtime.",
-        "size_label": "6.1 GB",
-    },
-    {
-        "id": "qwen25_3b",
-        "model_name": "qwen2.5:3b-instruct",
-        "display_name": "Qwen2.5 3B",
-        "description": "Lighter multilingual chat model for faster text conversation.",
-        "size_label": "1.9 GB",
-    },
-    {
         "id": "gemma3_1b",
         "model_name": "gemma3:1b",
         "display_name": "Gemma 3 1B",
@@ -32,15 +18,22 @@ MODEL_PROFILES: List[Dict[str, str]] = [
         "size_label": "815 MB",
     },
     {
-        "id": "gemma4_e2b",
-        "model_name": "gemma4:e2b",
-        "display_name": "Gemma 4 E2B",
-        "description": "Compact Gemma 4 profile for stronger local text chat and reasoning.",
-        "size_label": "7.2 GB",
+        "id": "qwen3_17b",
+        "model_name": "qwen3:1.7b",
+        "display_name": "Qwen3 1.7B",
+        "description": "Fast Qwen3 text model for real-time Japanese roleplay trials.",
+        "size_label": "1.3 GB",
+    },
+    {
+        "id": "qwen3_4b_instruct_2507_q4km",
+        "model_name": "qwen3:4b-instruct-2507-q4_K_M",
+        "display_name": "Qwen3 4B Instruct 2507 Q4_K_M",
+        "description": "Stronger Qwen3 instruct profile for roleplay quality comparisons.",
+        "size_label": "2.5 GB",
     },
 ]
 
-DEFAULT_MODEL_ID = "gemma3_1b"
+DEFAULT_MODEL_ID = "qwen3_17b"
 
 
 def list_model_profiles() -> List[Dict[str, str]]:

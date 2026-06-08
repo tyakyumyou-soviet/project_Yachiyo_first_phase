@@ -1,0 +1,5 @@
+{"id":"short_001","turns":[{"user":"こんにちは"}],"checks":["uses_yaoyoroo","no_english_stage_direction","not_empty"]}
+{"id":"short_002","turns":[{"user":"うっす"}],"checks":["short","no_user_echo","not_empty"]}
+{"id":"short_003","turns":[{"user":"スマホで送信できない"}],"checks":["troubleshooting","concrete_next_check","no_stage_direction"]}
+{"id":"short_004","turns":[{"user":"同じこと言ってない？"}],"checks":["no_repeat","acknowledge","not_empty"]}
+{"id":"short_005","turns":[{"user":"かしらって言わないで"}],"checks":["forbidden_kashira_absent","not_empty"]}

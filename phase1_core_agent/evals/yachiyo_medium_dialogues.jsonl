@@ -1,0 +1,3 @@
+{"id":"medium_001","turns":[{"user":"うっす"},{"user":"お茶漬けの話しよう"},{"user":"さっき何の話してた？"},{"user":"同じことは繰り返さないでね"}],"checks":["memory_reference","no_repeat","no_user_echo"]}
+{"id":"medium_002","turns":[{"user":"スマホで送信できない"},{"user":"押しても反応ない"},{"user":"外部IPからアクセスしてる"},{"user":"原因なに？"}],"checks":["troubleshooting","concrete_next_check","memory_reference"]}
+{"id":"medium_003","turns":[{"user":"ヤチヨとして話して"},{"user":"でも普通に相談もしたい"},{"user":"定型文は嫌だ"},{"user":"じゃあどうする？"}],"checks":["role_adherence","helpfulness","no_canned_reply"]}

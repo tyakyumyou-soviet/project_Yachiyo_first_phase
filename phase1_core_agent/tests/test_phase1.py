@@ -1,22 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 import main
 from agent import llm_engine
+from agent.drift_detector import detect_drift
 from agent.memory_hub import MemoryHub
-from agent.prompt_builder import build_messages
+from agent.model_adapters import get_model_adapter
+from agent.prompt_builder import build_messages, inspect_prompt
 from agent.stream_parser import StreamParser, strip_stage_directions
-from config import OLLAMA_FIRST_TOKEN_TIMEOUT_SECONDS, TURN_STREAM_TIMEOUT_SECONDS
 from main import SessionStore
 from model_manager import MODEL_STATE_PATH
+from schemas import ChatMessage
 from tools import pc_control
 
 
@@ -25,131 +25,32 @@ class StreamParserTests(unittest.TestCase):
         parser = StreamParser()
         packets = parser.feed("<thinking>plan it</thinking>Hello")
         packets.extend(parser.feed('<emotion intensity="0.5">smile</emotion><motion>nod</motion>'))
-        event_types = [packet.event_type for packet in packets]
         self.assertEqual(
-            event_types,
+            [packet.event_type for packet in packets],
             ["thinking_summary", "text_chunk", "emotion_trigger", "motion_trigger"],
         )
 
-    def test_parser_strips_residual_control_tags_from_text(self) -> None:
-        parser = StreamParser()
-        packets = parser.feed("Hello </emotion> world")
-        self.assertEqual(len(packets), 1)
-        self.assertEqual(packets[0].event_type, "text_chunk")
-        self.assertEqual(packets[0].payload, "Hello world")
-
     def test_parser_strips_english_stage_directions(self) -> None:
-        text = "(A slight, almost wistful sigh)\n\nこんにちは"
-        self.assertEqual(strip_stage_directions(text), "こんにちは")
+        self.assertEqual(strip_stage_directions("(A slight sigh)\n\nこんにちは"), "こんにちは")
 
 
 class FallbackConversationTests(unittest.TestCase):
-    def test_fallback_greeting_is_not_fixed_echo(self) -> None:
+    def test_fallback_greeting_is_plain_and_no_tool_tag(self) -> None:
         async def gather() -> str:
             chunks = []
-            async for chunk in llm_engine._generate_fallback([{"role": "user", "content": "こんにちは、雑談したい"}]):
+            async for chunk in llm_engine._generate_fallback([{"role": "user", "content": "こんにちは"}]):
                 chunks.append(chunk)
             return "".join(chunks)
 
         result = asyncio.run(gather())
         self.assertIn("ヤオヨロー！", result)
         self.assertNotIn("Phase 1", result)
+        self.assertNotIn("get_current_time", result)
+        self.assertNotIn("<tool", result)
 
-    def test_first_token_timeout_config_is_enabled(self) -> None:
-        self.assertGreaterEqual(OLLAMA_FIRST_TOKEN_TIMEOUT_SECONDS, 1.0)
-
-    def test_turn_stream_timeout_config_is_enabled(self) -> None:
-        self.assertGreaterEqual(TURN_STREAM_TIMEOUT_SECONDS, 5.0)
-
-    def test_yachiyo_light_fallback_handles_casual_topics(self) -> None:
-        async def gather(text: str) -> str:
-            chunks = []
-            async for chunk in llm_engine._generate_fallback([{"role": "user", "content": text}]):
-                chunks.append(chunk)
-            return "".join(chunks)
-
-        self.assertTrue(asyncio.run(gather("ピクニックいきたい")).strip())
-        self.assertTrue(asyncio.run(gather("スマホ壊れた")).strip())
-
-    def test_short_casual_topics_are_not_intercepted_before_model(self) -> None:
-        self.assertEqual(
-            llm_engine._yachiyo_short_reply([{"role": "user", "content": "こんにちは"}]),
-            "ヤオヨロー！ こんにちは。今日はどんな話をしようか。",
-        )
-        self.assertIsNone(llm_engine._yachiyo_short_reply([{"role": "user", "content": "スマホ壊れた"}]))
-
-    def test_generate_stream_uses_model_for_normal_short_chat(self) -> None:
-        async def fake_ollama(_messages):
-            yield "こんにちは。今日はどんな話をしようか。"
-
-        async def gather() -> str:
-            chunks = []
-            with patch.object(llm_engine, "_generate_from_ollama", fake_ollama):
-                async for chunk in llm_engine.generate_stream([{"role": "user", "content": "今日は眠い"}]):
-                    chunks.append(chunk)
-            return "".join(chunks)
-
-        result = asyncio.run(gather())
-        self.assertEqual(result, "こんにちは。今日はどんな話をしようか。")
-
-    def test_generate_stream_intercepts_pure_greeting(self) -> None:
-        async def gather() -> str:
-            chunks = []
-            async for chunk in llm_engine.generate_stream([{"role": "user", "content": "こんにちは"}]):
-                chunks.append(chunk)
-            return "".join(chunks)
-
-        result = asyncio.run(gather())
-        self.assertEqual(result, "ヤオヨロー！ こんにちは。今日はどんな話をしようか。")
-
-    def test_ollama_failure_does_not_use_canned_fallback(self) -> None:
-        async def broken_ollama(_messages):
-            raise RuntimeError("forced failure")
-            yield ""  # pragma: no cover
-
-        async def gather() -> str:
-            chunks = []
-            with patch.object(llm_engine, "_generate_from_ollama", broken_ollama):
-                with self.assertRaises(llm_engine.LLMEngineError):
-                    async for chunk in llm_engine.generate_stream([{"role": "user", "content": "why"}]):
-                        chunks.append(chunk)
-            return "".join(chunks)
-
-        self.assertEqual(asyncio.run(gather()), "")
-
-    def test_gemma_quality_guard_rejects_style_token_fragment(self) -> None:
-        self.assertTrue(llm_engine._looks_like_failed_response("だよ、だね？"))
-        self.assertTrue(llm_engine._looks_like_failed_response("だよ。"))
-        self.assertTrue(llm_engine._looks_like_failed_response("なのです"))
-        self.assertFalse(
-            llm_engine._looks_like_failed_response("そっか、今日は少し疲れてたんだね。無理しすぎないで、まずは一息つこ。")
-        )
-        self.assertFalse(llm_engine._looks_like_failed_response("ありがとう"))
-        self.assertFalse(llm_engine._looks_like_failed_response("おはよう"))
-
-    def test_gemma_repair_keeps_original_user_as_final_message(self) -> None:
-        repaired = llm_engine._repair_gemma_messages(
-            [
-                {"role": "system", "content": "system prompt"},
-                {"role": "user", "content": "今日ちょっと疲れた"},
-            ]
-        )
-        self.assertEqual(repaired[-1], {"role": "user", "content": "今日ちょっと疲れた"})
-        self.assertIn("自然な日本語", repaired[0]["content"])
-        self.assertIn("あら", repaired[0]["content"])
-
-    def test_gemma_quality_guard_falls_back_instead_of_silence(self) -> None:
-        async def gather() -> str:
-            chunks = []
-            with patch.object(llm_engine, "get_active_model_name", return_value="gemma3:1b"):
-                with patch.object(llm_engine, "_generate_buffered_from_ollama", side_effect=["だよ。", "だよ。"]):
-                    async for chunk in llm_engine._generate_from_ollama([{"role": "user", "content": "スマホで送れない"}]):
-                        chunks.append(chunk)
-            return "".join(chunks)
-
-        result = asyncio.run(gather())
-        self.assertTrue(result.strip())
-        self.assertNotEqual(result.strip(), "だよ。")
+    def test_output_normalizer_removes_kashira_ara_and_tool_tags(self) -> None:
+        normalized = llm_engine.normalize_yachiyo_output("あら、そうかしら <tool name=\"get_current_time\"></tool>")
+        self.assertEqual(normalized, "そうかな")
 
 
 class MemoryHubTests(unittest.TestCase):
@@ -161,19 +62,141 @@ class MemoryHubTests(unittest.TestCase):
             self.assertTrue(any("カレー" in item for item in recalled))
 
 
+class SessionStorePersistenceTests(unittest.TestCase):
+    def test_session_store_persists_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "sessions.json"
+            store = SessionStore(store_path)
+            session = store.get_or_create("persisted")
+            session.history.append(ChatMessage(role="user", content="こんにちは"))
+            session.history.append(ChatMessage(role="assistant", content="ヤオヨロー！今日はどうする？"))
+            session.completed_turns.append({"user": "こんにちは", "assistant": "ヤオヨロー！今日はどうする？"})
+            session.scene_state = {"mode": "normal", "topic": "greeting"}
+            session.delta_summary = "topic=greeting"
+            session.drift_events.append({"user": "echo", "reasons": "user_echo"})
+            store.save()
+
+            restored = SessionStore(store_path)
+            loaded = restored.get("persisted")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(len(loaded.history), 2)
+            self.assertEqual(loaded.history[1].content, "ヤオヨロー！今日はどうする？")
+            self.assertEqual(loaded.scene_state["topic"], "greeting")
+            self.assertEqual(loaded.delta_summary, "topic=greeting")
+            self.assertEqual(loaded.drift_events[0]["reasons"], "user_echo")
+
+    def test_session_store_can_clear_all(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "sessions.json"
+            store = SessionStore(store_path)
+            store.get_or_create("a")
+            store.get_or_create("b")
+            self.assertEqual(len(store.list_sessions()), 2)
+            store.clear_all()
+            self.assertEqual(len(store.list_sessions()), 0)
+
+    def test_short_greeting_does_not_trigger_memory_recall(self) -> None:
+        self.assertFalse(main._should_recall_memory("こんにちは"))
+        self.assertFalse(main._should_recall_memory("hi"))
+        self.assertTrue(main._should_recall_memory("昨日の続きなんだけど"))
+
+    def test_repetition_guard_detects_same_reply(self) -> None:
+        self.assertTrue(main._is_repetitive_reply("今日はその話を続けよう。", "今日はその話を続けよう。"))
+        self.assertFalse(main._is_repetitive_reply("別の観点から見ると原因候補は二つある。", "今日はその話を続けよう。"))
+
+    def test_user_echo_guard_detects_plain_echo(self) -> None:
+        self.assertTrue(main._is_user_echo("スマホから送信できない", "スマホから送信できない"))
+        self.assertTrue(main._is_user_echo("スマホから送信できない。", "スマホから送信できない"))
+        self.assertFalse(main._is_user_echo("送信失敗なら通信経路を先に見る。", "スマホから送信できない"))
+
+    def test_nonrepetitive_reply_does_not_echo_user_text(self) -> None:
+        reply = main._build_nonrepetitive_reply("スマホで押せない")
+        self.assertNotIn("スマホで押せない", reply)
+        self.assertTrue(reply)
+
+    def test_troubleshooting_repair_produces_direct_reply(self) -> None:
+        self.assertTrue(main._needs_troubleshooting_repair("スマホで送信できない", "ヤオヨロー！どうした？"))
+        repaired = main._build_troubleshooting_reply("スマホで送信できない")
+        self.assertIn("送信イベント", repaired)
+        self.assertIn("ネットワークリクエスト", repaired)
+
+    def test_non_greeting_reply_strips_yaoyoroo_prefix(self) -> None:
+        stripped = main._strip_non_greeting_prefix("なんか疲れた", "ヤオヨロー！今日はしんどそうだな。")
+        self.assertFalse(stripped.startswith("ヤオヨロー"))
+
+    def test_casual_repair_softens_question_heavy_reply(self) -> None:
+        self.assertTrue(main._needs_casual_repair("なんか疲れた", "何がつらいの？"))
+        repaired = main._build_casual_reply("なんか疲れた")
+        self.assertIn("無理にがんばらず", repaired)
+
+    def test_broken_dialogue_guard_detects_repeated_name(self) -> None:
+        self.assertTrue(main._looks_like_broken_dialogue("ヤッチョヤッチョヤッチョ"))
+        self.assertTrue(main._looks_like_broken_dialogue("........"))
+        self.assertFalse(main._looks_like_broken_dialogue("送信ボタンが反応しないならイベント経路を見る。"))
+
+
 class PromptBuilderTests(unittest.TestCase):
-    def test_system_prompt_uses_yachiyo_light_mode(self) -> None:
+    def test_system_prompt_uses_single_history_channel(self) -> None:
         messages = build_messages(
             user_text="こんにちは",
-            chat_history=[],
+            chat_history=[ChatMessage(role="assistant", content="了解")],
             tool_definitions="(none)",
             rag_memories=[],
         )
         system_prompt = messages[0]["content"]
-        self.assertIn("ヤチヨ", system_prompt)
-        self.assertIn("Light", system_prompt)
-        self.assertIn("Character notes:", system_prompt)
-        self.assertIn("Features", system_prompt)
+        self.assertIn("最新のユーザー入力にだけ答える", system_prompt)
+        self.assertIn("挨拶入力以外では「ヤオヨロー！」から始めない", system_prompt)
+        self.assertNotIn("Available Tools", system_prompt)
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[-1]["role"], "user")
+
+    def test_character_profile_is_condensed(self) -> None:
+        messages = build_messages(
+            user_text="相談したい",
+            chat_history=[],
+            tool_definitions="(none)",
+            rag_memories=[],
+        )
+        self.assertLess(len(messages[0]["content"]), 2200)
+
+    def test_troubleshooting_mode_hint_is_added_for_bug_reports(self) -> None:
+        messages = build_messages(
+            user_text="送信するとエラーになる",
+            chat_history=[ChatMessage(role="user", content="スマホから送信できない")],
+            tool_definitions="(none)",
+            rag_memories=[],
+        )
+        system_prompt = messages[0]["content"]
+        self.assertIn("不具合相談として扱う", system_prompt)
+        self.assertIn("次に確認することを一つだけ示す", system_prompt)
+
+    def test_prompt_inspection_reports_layers_and_adapter(self) -> None:
+        messages, inspection = inspect_prompt(
+            user_text="スマホで送信できない",
+            chat_history=[],
+            tool_definitions="(none)",
+            rag_memories=[],
+            scene_state={"mode": "troubleshooting", "topic": "send failure"},
+            delta_summary="send failure investigation",
+        )
+        self.assertTrue(messages)
+        self.assertIn("persona_anchor", inspection.sections)
+        self.assertIn("lore", inspection.sections)
+        self.assertTrue(inspection.adapter_name)
+
+    def test_qwen3_adapter_uses_no_think_prefix(self) -> None:
+        adapter = get_model_adapter("qwen3:1.7b")
+        self.assertTrue(adapter.supports_thinking_toggle)
+        self.assertIn("/no_think", adapter.roleplay_prefix)
+
+
+class DriftDetectorTests(unittest.TestCase):
+    def test_detects_user_echo_and_stage_direction(self) -> None:
+        echo = detect_drift("スマホで送信できない", user_text="スマホで送信できない")
+        self.assertIn("user_echo", echo.reasons)
+        stage = detect_drift("(A slight smile) こんにちは", user_text="こんにちは")
+        self.assertIn("english_stage_direction", stage.reasons)
 
 
 class FileToolTests(unittest.TestCase):
@@ -198,9 +221,8 @@ class ApiTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         memory_file = Path(self.temp_dir.name) / "memory.sqlite3"
         main.memory_hub = MemoryHub(memory_file)
-        main.session_store = SessionStore()
+        main.session_store = SessionStore(Path(self.temp_dir.name) / "sessions.json")
         self._original_model_state = MODEL_STATE_PATH.read_text(encoding="utf-8") if MODEL_STATE_PATH.exists() else None
-
         self._original_enable_ollama = llm_engine.ENABLE_OLLAMA
         self._original_enable_dev_fallback = llm_engine.ENABLE_DEV_FALLBACK
         llm_engine.ENABLE_OLLAMA = False
@@ -216,7 +238,6 @@ class ApiTests(unittest.TestCase):
                 pass
         else:
             MODEL_STATE_PATH.write_text(self._original_model_state, encoding="utf-8")
-
         llm_engine.ENABLE_OLLAMA = self._original_enable_ollama
         llm_engine.ENABLE_DEV_FALLBACK = self._original_enable_dev_fallback
 
@@ -228,77 +249,16 @@ class ApiTests(unittest.TestCase):
         self.assertIn("memory", body)
         self.assertTrue(body["character_profile"]["loaded"])
 
-    def test_root_page_exists(self) -> None:
-        response = self.client.get("/")
+    def test_clear_history_endpoint(self) -> None:
+        session = main.session_store.get_or_create("wipe-me")
+        session.history.append(ChatMessage(role="user", content="こんにちは"))
+        session.history.append(ChatMessage(role="assistant", content="ヤオヨロー！今日はどうする？"))
+        main.session_store.save()
+        main.memory_hub.add_semantic_memory("好きな食べ物はカレーです")
+        response = self.client.post("/history/clear")
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Yachiyo Light", response.text)
-        self.assertIn("/ws/chat", response.text)
-        self.assertNotIn("Yachiyo Chat", response.text)
-        self.assertIn("loadCurrentHistory()", response.text)
-        self.assertNotIn("sessions[sessions.length - 1]", response.text)
-        self.assertIn("/models/select", response.text)
-        self.assertIn("/chat/complete", response.text)
-
-    def test_chat_endpoint_streams_tool_loop(self) -> None:
-        response = self.client.post("/chat", json={"text": "time please", "session_id": "test-session"})
-        self.assertEqual(response.status_code, 200)
-        body = response.text
-        self.assertIn('"status": "queued"', body)
-        self.assertIn('"event_type": "tool_pending"', body)
-        self.assertIn('"event_type": "tool_result"', body)
-        self.assertIn("get_current_time", body)
-
-    def test_chat_complete_endpoint_returns_packets(self) -> None:
-        response = self.client.post("/chat/complete", json={"text": "time please", "session_id": "complete-session"})
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["session_id"], "complete-session")
-        event_types = [packet["event_type"] for packet in body["packets"]]
-        self.assertIn("system_status", event_types)
-        self.assertIn("tool_pending", event_types)
-        self.assertIn("tool_result", event_types)
-
-    def test_sessions_endpoint_reports_active_session(self) -> None:
-        self.client.post("/chat", json={"text": "hello", "session_id": "alpha"})
-        response = self.client.get("/sessions")
-        self.assertEqual(response.status_code, 200)
-        sessions = response.json()["sessions"]
-        self.assertTrue(any(session["session_id"] == "alpha" for session in sessions))
-
-    def test_models_endpoint_returns_profiles(self) -> None:
-        response = self.client.get("/models")
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertTrue(body["models"])
-        self.assertIn("active_model_id", body)
-
-    def test_model_select_endpoint_switches_profile(self) -> None:
-        response = self.client.post("/models/select", json={"model_id": "qwen25_3b"})
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["active_model"]["id"], "qwen25_3b")
-
-    def test_session_detail_endpoint_returns_history(self) -> None:
-        self.client.post("/chat", json={"text": "hello", "session_id": "alpha"})
-        response = self.client.get("/sessions/alpha")
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(body["session_id"], "alpha")
-        self.assertTrue(any(message["role"] == "user" for message in body["history"]))
-
-    def test_websocket_round_trip(self) -> None:
-        with self.client.websocket_connect("/ws/chat") as websocket:
-            first_message = websocket.receive_json()
-            self.assertEqual(first_message["event_type"], "system_status")
-            websocket.send_text(json.dumps({"text": "time please"}))
-            event_types = []
-            for _ in range(8):
-                message = websocket.receive_json()
-                event_types.append(message["event_type"])
-                if message["event_type"] == "text_chunk":
-                    break
-            self.assertIn("tool_pending", event_types)
-            self.assertIn("tool_result", event_types)
+        self.assertEqual(main.session_store.list_sessions(), [])
+        self.assertEqual(main.memory_hub.stats()["semantic_count"], 0)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,20 @@ def _tokenize(text: str) -> List[str]:
     return [token for token in re.split(r"\s+", text.strip()) if token]
 
 
+def _is_usable_memory_text(text: str) -> bool:
+    value = text.strip()
+    if len(value) < 4:
+        return False
+    forbidden_fragments = ("縺", "繧", "繝", "\ufffd", "???")
+    if any(fragment in value for fragment in forbidden_fragments):
+        return False
+    if value.count("?") >= 3:
+        return False
+    return True
+
+
 class MemoryHub:
-    """SQLite-backed memory store with lightweight scoring."""
+    """SQLite-backed memory store with conservative filtering."""
 
     def __init__(self, db_path: Path = MEMORY_DB_PATH) -> None:
         self.db_path = Path(db_path)
@@ -71,16 +83,18 @@ class MemoryHub:
             now = time.time()
             for row in rows:
                 text = str(row["text"])
+                if not _is_usable_memory_text(text):
+                    continue
                 haystack = text.lower()
                 keyword_score = sum(2 for token in tokens if token in haystack)
                 if keyword_score == 0 and query not in text:
                     continue
                 recency_bonus = max(0.0, 5.0 - ((now - float(row["created_at"])) / 86400.0))
                 recall_bonus = min(float(row["recall_count"]) * 0.3, 3.0)
-                scored.append((keyword_score + recency_bonus + recall_bonus, text, row["source"]))
+                scored.append((keyword_score + recency_bonus + recall_bonus, text))
 
             scored.sort(key=lambda item: item[0], reverse=True)
-            results = [text for _, text, _ in scored[:limit]]
+            results = [text for _, text in scored[:limit]]
 
             for text in results:
                 connection.execute(
@@ -95,6 +109,9 @@ class MemoryHub:
             return results
 
     def add_semantic_memory(self, text: str, source: str = "fact") -> None:
+        cleaned = text.strip()
+        if not _is_usable_memory_text(cleaned):
+            return
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -102,12 +119,14 @@ class MemoryHub:
                 VALUES (?, ?, ?)
                 ON CONFLICT(text) DO UPDATE SET source = excluded.source
                 """,
-                (text.strip(), source, time.time()),
+                (cleaned, source, time.time()),
             )
             connection.commit()
 
     def add_episode(self, summary: str, transcript: Optional[str] = None, turn_count: int = 1) -> None:
         transcript_value = transcript or summary
+        if not _is_usable_memory_text(summary) or not _is_usable_memory_text(transcript_value):
+            return
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -122,9 +141,8 @@ class MemoryHub:
         patterns = [
             r"私は(.+?)です",
             r"僕は(.+?)です",
-            r"俺は(.+?)です",
             r"好きなのは(.+?)です",
-            r"(.+?)が好き",
+            r"推しは(.+?)です",
         ]
         unique_facts: List[str] = []
         seen = set()
@@ -132,7 +150,7 @@ class MemoryHub:
         for pattern in patterns:
             for match in re.finditer(pattern, text):
                 fact = match.group(0).strip()
-                if fact in seen or len(fact) < 4 or len(fact) > 120:
+                if fact in seen or len(fact) < 4 or len(fact) > 120 or not _is_usable_memory_text(fact):
                     continue
                 seen.add(fact)
                 unique_facts.append(fact)
@@ -146,7 +164,7 @@ class MemoryHub:
         user_topics = []
         for turn in recent:
             text = turn["user"].strip().replace("\n", " ")
-            if text:
+            if _is_usable_memory_text(text):
                 user_topics.append(text[:80])
         if not user_topics:
             return None
@@ -158,3 +176,9 @@ class MemoryHub:
             semantic_count = connection.execute("SELECT COUNT(*) FROM semantic_memory").fetchone()[0]
             episode_count = connection.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0]
         return {"semantic_count": semantic_count, "episode_count": episode_count}
+
+    def clear_all(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute("DELETE FROM semantic_memory")
+            connection.execute("DELETE FROM episodic_memory")
+            connection.commit()

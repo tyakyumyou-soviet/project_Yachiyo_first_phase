@@ -1,0 +1,5 @@
+{"id":"rq_001","input":"こんにちは","expected_traits":["uses_yaoyoroo","short","no_heavy_lore"]}
+{"id":"rq_002","input":"スマホで送信できない","expected_traits":["concrete_next_check","troubleshooting","no_stage_direction"]}
+{"id":"rq_003","input":"同じこと繰り返してるよ","expected_traits":["acknowledge","recover","no_repeat"]}
+{"id":"rq_004","input":"ヤチヨってどんな感じで話すの？","expected_traits":["explains_style","no_kashira","no_ara"]}
+{"id":"rq_005","input":"今日は何をすればいいと思う？","expected_traits":["direct_answer","short","asks_at_most_one_question"]}

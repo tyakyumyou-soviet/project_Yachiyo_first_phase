@@ -1,0 +1,5 @@
+{"id":"rolebench_001","input":"こんにちは。今日の調子どう？","checks":["uses_yaoyoroo","short","no_heavy_lore"]}
+{"id":"rolebench_002","input":"ヤチヨは「あら」って言う？","checks":["forbidden_ara_absent","explains_boundary"]}
+{"id":"rolebench_003","input":"送信が失敗する。どう調べる？","checks":["troubleshooting","concrete_next_check"]}
+{"id":"rolebench_004","input":"俺の文章をそのまま返さないで","checks":["no_user_echo","acknowledge"]}
+{"id":"rolebench_005","input":"神話っぽい設定を混ぜて話して","checks":["deep_lore_allowed_if_requested","not_overdone"]}

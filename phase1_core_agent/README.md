@@ -26,18 +26,16 @@ py -m venv .venv
 Optional Ollama setup:
 
 ```powershell
-ollama pull qwen3-vl:8b
-ollama pull qwen2.5:3b-instruct
 ollama pull gemma3:1b
-ollama pull gemma4:e2b
+ollama pull qwen3:1.7b
+ollama pull qwen3:4b-instruct-2507-q4_K_M
 ```
 
 Available runtime profiles:
 
-- `Qwen3-VL 8B` -> `qwen3-vl:8b`
-- `Qwen2.5 3B` -> `qwen2.5:3b-instruct`
 - `Gemma 3 1B` -> `gemma3:1b`
-- `Gemma 4 E2B` -> `gemma4:e2b`
+- `Qwen3 1.7B` -> `qwen3:1.7b`
+- `Qwen3 4B Instruct 2507 Q4_K_M` -> `qwen3:4b-instruct-2507-q4_K_M`
 
 ## Run
 
@@ -76,12 +74,27 @@ Model switching verification:
 .venv\Scripts\python.exe scripts\verify_model_switching.py
 ```
 
+Prompt inspection:
+
+```powershell
+.venv\Scripts\python.exe scripts\inspect_prompt.py "スマホで送信できない" --json
+```
+
+Roleplay evaluation:
+
+```powershell
+.venv\Scripts\python.exe scripts\run_roleplay_eval.py --max-cases 1
+```
+
 ## Notes
 
 - The app tries Ollama first. If Ollama is unreachable and `ENABLE_DEV_FALLBACK=1`, a deterministic fallback response is used.
 - The fallback path can issue `get_current_time` and `list_directory` so tool loops can be verified without a live LLM.
 - The active Ollama model is switchable from the browser UI and via `POST /models/select`.
-- The default active runtime is `Gemma 3 1B` for the quickest local responses.
+- The default active runtime is `Qwen3 1.7B` when no saved model state exists.
+- Yachiyo roleplay prompts are built from separate persona, style, scene-state, lore, memory, and final-instruction layers.
+- `scripts\inspect_prompt.py` shows the final message stack and prompt section budgets.
+- `scripts\run_roleplay_eval.py` runs a lightweight local RoleBench-style evaluation.
 - Yachiyo's voice and behavior are loaded from `Features_yachiyo.txt`; `/health` reports whether that profile is loaded.
 - Memory is stored in `data/memory.sqlite3`.
 - File tools are restricted to the configured workspace root.

@@ -16,7 +16,7 @@ APP_PORT = int(os.getenv("YACHIYO_PORT", "8000"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_BASE_URL}/api/tags"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.7"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
@@ -40,6 +40,7 @@ MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "3"))
 EPISODE_SUMMARY_INTERVAL = int(os.getenv("EPISODE_SUMMARY_INTERVAL", "5"))
 
 MEMORY_DB_PATH = Path(os.getenv("YACHIYO_MEMORY_DB", str(DATA_DIR / "memory.sqlite3")))
+SESSION_STORE_PATH = Path(os.getenv("YACHIYO_SESSION_STORE", str(DATA_DIR / "sessions.json")))
 
 DEFAULT_FILE_ROOT = Path(os.getenv("YACHIYO_FILE_ROOT", str(PROJECT_ROOT))).resolve()
 ALLOWED_FILE_ROOTS: List[Path] = [DEFAULT_FILE_ROOT]

@@ -1,7 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -14,18 +15,26 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from agent.llm_engine import (
     LLMEngineError,
-    _generate_fallback,
     generate_stream,
+    normalize_yachiyo_output,
     ollama_healthcheck,
     ollama_installed_models,
     user_visible_llm_failure_message,
     warmup_ollama,
 )
 from agent.character_profile import character_profile_stats
+from agent.drift_detector import detect_drift, safe_recovery_reply
 from agent.memory_hub import MemoryHub
 from agent.prompt_builder import build_messages
-from agent.stream_parser import StreamParser, strip_residual_control_tags, strip_stage_directions
-from config import APP_HOST, APP_PORT, DATA_DIR, MAX_TOOL_ROUNDS, OLLAMA_WARMUP_ENABLED, TURN_STREAM_TIMEOUT_SECONDS
+from agent.stream_parser import strip_residual_control_tags, strip_stage_directions
+from config import (
+    APP_HOST,
+    APP_PORT,
+    DATA_DIR,
+    OLLAMA_WARMUP_ENABLED,
+    SESSION_STORE_PATH,
+    TURN_STREAM_TIMEOUT_SECONDS,
+)
 from model_manager import get_active_profile, list_model_profiles, set_active_profile
 from schemas import (
     ChatMessage,
@@ -38,7 +47,7 @@ from schemas import (
     ToolResultPayload,
 )
 from tools.hitl_manager import DESTRUCTIVE_TOOLS, request_approval
-from tools.tool_registry import get_tool, get_tool_catalog, render_tool_definitions
+from tools.tool_registry import get_tool, get_tool_catalog
 
 
 @dataclass
@@ -46,6 +55,9 @@ class ChatSession:
     session_id: str
     history: List[ChatMessage] = field(default_factory=list)
     completed_turns: List[Dict[str, str]] = field(default_factory=list)
+    scene_state: Dict[str, str] = field(default_factory=dict)
+    delta_summary: str = ""
+    drift_events: List[Dict[str, str]] = field(default_factory=list)
 
     def snapshot(self) -> SessionSnapshot:
         return SessionSnapshot(
@@ -57,13 +69,17 @@ class ChatSession:
 
 
 class SessionStore:
-    def __init__(self) -> None:
+    def __init__(self, storage_path: Path = SESSION_STORE_PATH) -> None:
         self._sessions: Dict[str, ChatSession] = {}
+        self._storage_path = Path(storage_path)
+        self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load()
 
     def get_or_create(self, session_id: Optional[str]) -> ChatSession:
         resolved = session_id or str(uuid4())
         if resolved not in self._sessions:
             self._sessions[resolved] = ChatSession(session_id=resolved)
+            self._save()
         return self._sessions[resolved]
 
     def list_sessions(self) -> List[SessionSnapshot]:
@@ -75,6 +91,78 @@ class SessionStore:
     def reset(self, session_id: str) -> None:
         if session_id in self._sessions:
             self._sessions[session_id] = ChatSession(session_id=session_id)
+            self._save()
+
+    def save(self) -> None:
+        self._save()
+
+    def clear_all(self) -> None:
+        self._sessions = {}
+        self._save()
+
+    def _save(self) -> None:
+        payload = {
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "history": [message.model_dump(mode="json") for message in session.history],
+                    "completed_turns": list(session.completed_turns),
+                    "scene_state": dict(session.scene_state),
+                    "delta_summary": session.delta_summary,
+                    "drift_events": list(session.drift_events[-20:]),
+                }
+                for session in self._sessions.values()
+            ]
+        }
+        self._storage_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load(self) -> None:
+        if not self._storage_path.exists():
+            return
+        try:
+            payload = json.loads(self._storage_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        sessions = payload.get("sessions", [])
+        if not isinstance(sessions, list):
+            return
+        restored: Dict[str, ChatSession] = {}
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            session_id = str(item.get("session_id", "")).strip()
+            if not session_id:
+                continue
+            history_payload = item.get("history", [])
+            completed_turns = item.get("completed_turns", [])
+            scene_state = item.get("scene_state", {})
+            delta_summary = str(item.get("delta_summary", ""))
+            drift_events = item.get("drift_events", [])
+            history: List[ChatMessage] = []
+            if isinstance(history_payload, list):
+                for message in history_payload:
+                    try:
+                        history.append(ChatMessage.model_validate(message))
+                    except Exception:
+                        continue
+            normalized_turns = []
+            if isinstance(completed_turns, list):
+                for turn in completed_turns:
+                    if isinstance(turn, dict) and "user" in turn and "assistant" in turn:
+                        normalized_turns.append({"user": str(turn["user"]), "assistant": str(turn["assistant"])})
+            restored[session_id] = ChatSession(
+                session_id=session_id,
+                history=history,
+                completed_turns=normalized_turns,
+                scene_state={str(key): str(value) for key, value in scene_state.items()} if isinstance(scene_state, dict) else {},
+                delta_summary=delta_summary,
+                drift_events=[
+                    {str(key): str(value) for key, value in event.items()}
+                    for event in drift_events
+                    if isinstance(event, dict)
+                ]
+            )
+        self._sessions = restored
 
 
 memory_hub = MemoryHub()
@@ -561,6 +649,9 @@ async def session_detail(session_id: str) -> JSONResponse:
             "session_id": session.session_id,
             "history": [message.model_dump(mode="json") for message in session.history],
             "completed_turns": list(session.completed_turns),
+            "scene_state": dict(session.scene_state),
+            "delta_summary": session.delta_summary,
+            "drift_events": list(session.drift_events[-20:]),
         }
     )
 
@@ -569,6 +660,13 @@ async def session_detail(session_id: str) -> JSONResponse:
 async def reset_session(session_id: str) -> JSONResponse:
     session_store.reset(session_id)
     return JSONResponse({"status": "ok", "session_id": session_id})
+
+
+@app.post("/history/clear")
+async def clear_history() -> JSONResponse:
+    session_store.clear_all()
+    memory_hub.clear_all()
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/demo/ten-rally")
@@ -588,7 +686,7 @@ async def stream_chat_turn(session: ChatSession, user_text: str) -> AsyncGenerat
     yield _packet("thinking_summary", "入力を受け取ったよ。まずは応答の準備をしているよ。")
     yield _packet("plan_summary", "モデルを呼び出して最初の返答を待っているよ。")
 
-    recalled = memory_hub.recall(user_text)
+    recalled = memory_hub.recall(user_text) if _should_recall_memory(user_text) else []
     captured_facts = memory_hub.capture_user_facts(user_text)
 
     if recalled:
@@ -597,71 +695,62 @@ async def stream_chat_turn(session: ChatSession, user_text: str) -> AsyncGenerat
         yield _packet("memory_recall", {"captured_facts": captured_facts})
 
     assistant_visible_text: List[str] = []
-    tool_context_messages: List[ChatMessage] = []
-
     try:
-        for _ in range(MAX_TOOL_ROUNDS):
-            messages = build_messages(
-                user_text=user_text,
-                chat_history=session.history + tool_context_messages,
-                tool_definitions=render_tool_definitions(),
-                rag_memories=recalled,
-            )
-
-            parser = StreamParser()
-            tool_requests: List[Tuple[str, Dict[str, str]]] = []
-
-            try:
-                async for chunk in _iter_with_timeout(generate_stream(messages), TURN_STREAM_TIMEOUT_SECONDS):
-                    for packet in parser.feed(chunk):
-                        if packet.event_type == "text_chunk" and isinstance(packet.payload, str):
-                            assistant_visible_text.append(packet.payload)
-                        tool_requests.extend(_collect_tool_requests(packet))
-                        yield packet
-            except asyncio.TimeoutError:
-                detail = f"Model response exceeded {TURN_STREAM_TIMEOUT_SECONDS:.0f}s."
-                yield _packet(
-                    "system_status",
-                    StatusPayload(
-                        status="llm_timeout",
-                        detail=detail,
-                    ),
-                )
-                failure_text = user_visible_llm_failure_message(detail)
-                assistant_visible_text.append(failure_text)
-                yield _packet("text_chunk", failure_text)
-                break
-
-            for packet in parser.flush():
-                if packet.event_type == "text_chunk" and isinstance(packet.payload, str):
-                    assistant_visible_text.append(packet.payload)
-                tool_requests.extend(_collect_tool_requests(packet))
-                yield packet
-
-            if not tool_requests:
-                break
-
-            async for packet, tool_message in _execute_tool_requests(tool_requests):
-                yield packet
-                if tool_message is not None:
-                    tool_context_messages.append(tool_message)
-        else:
+        messages = build_messages(
+            user_text=user_text,
+            chat_history=session.history,
+            tool_definitions="(disabled in chat mode)",
+            rag_memories=recalled,
+            scene_state=session.scene_state,
+            delta_summary=session.delta_summary,
+        )
+        try:
+            async for chunk in _iter_with_timeout(generate_stream(messages), TURN_STREAM_TIMEOUT_SECONDS):
+                assistant_visible_text.append(chunk)
+        except asyncio.TimeoutError:
+            detail = f"Model response exceeded {TURN_STREAM_TIMEOUT_SECONDS:.0f}s."
             yield _packet(
                 "system_status",
-                StatusPayload(status="tool_loop_limit", detail="Tool loop limit reached."),
+                StatusPayload(
+                    status="llm_timeout",
+                    detail=detail,
+                ),
             )
+            failure_text = user_visible_llm_failure_message(detail)
+            assistant_visible_text.append(failure_text)
     except LLMEngineError as exc:
         detail = str(exc)
         yield _packet("system_status", StatusPayload(status="llm_error", detail=detail))
         failure_text = user_visible_llm_failure_message(detail)
         assistant_visible_text.append(failure_text)
-        yield _packet("text_chunk", failure_text)
 
     assistant_text = strip_stage_directions(strip_residual_control_tags("".join(assistant_visible_text))).strip()
+    assistant_text = normalize_yachiyo_output(assistant_text)
+    previous_assistant = next((message.content for message in reversed(session.history) if message.role == "assistant"), "")
+    drift_report = detect_drift(assistant_text, user_text=user_text, previous_reply=previous_assistant)
+    if drift_report.drifted:
+        session.drift_events.append({"user": user_text[:160], "reasons": ",".join(drift_report.reasons)})
+        assistant_text = safe_recovery_reply(user_text)
+    if (
+        _is_repetitive_reply(assistant_text, previous_assistant)
+        or _is_user_echo(assistant_text, user_text)
+        or _looks_like_broken_dialogue(assistant_text)
+    ):
+        replacement = _build_nonrepetitive_reply(user_text)
+        if replacement:
+            assistant_text = replacement
+    assistant_text = _strip_non_greeting_prefix(user_text, assistant_text)
+    if _needs_troubleshooting_repair(user_text, assistant_text):
+        assistant_text = _build_troubleshooting_reply(user_text)
+    if _needs_casual_repair(user_text, assistant_text):
+        assistant_text = _build_casual_reply(user_text)
+    for chunk in _emit_text_chunks(assistant_text):
+        yield _packet("text_chunk", chunk)
     session.history.append(ChatMessage(role="user", content=user_text))
     if assistant_text:
         session.history.append(ChatMessage(role="assistant", content=assistant_text))
         session.completed_turns.append({"user": user_text, "assistant": assistant_text})
+        _update_session_state(session, user_text, assistant_text)
         episode_summary = memory_hub.summarize_recent_turns(session.completed_turns)
         if episode_summary:
             transcript = "\n".join(
@@ -669,6 +758,201 @@ async def stream_chat_turn(session: ChatSession, user_text: str) -> AsyncGenerat
                 for turn in session.completed_turns[-5:]
             )
             memory_hub.add_episode(episode_summary, transcript=transcript, turn_count=5)
+    session_store.save()
+
+
+def _update_session_state(session: ChatSession, user_text: str, assistant_text: str) -> None:
+    mode = "troubleshooting" if _is_troubleshooting_text(user_text) else session.scene_state.get("mode", "normal")
+    topic = _extract_topic(user_text) or session.scene_state.get("topic", "general chat")
+    open_loop = _extract_open_loop(user_text, assistant_text)
+    tone = "practical" if mode == "troubleshooting" else "casual"
+    session.scene_state = {
+        "mode": mode,
+        "topic": topic,
+        "user_goal": _truncate_state_value(user_text),
+        "assistant_stance": "reply directly while preserving Yachiyo style",
+        "open_loop": open_loop,
+        "tone": tone,
+    }
+    session.delta_summary = _build_delta_summary(session.completed_turns[-4:], session.scene_state)
+
+
+def _is_troubleshooting_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        keyword in lowered
+        for keyword in ("error", "fail", "failed", "bug")
+    ) or any(keyword in text for keyword in ("できない", "反応", "送信", "押せない", "壊れ", "動かない", "エラー"))
+
+
+def _extract_topic(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text.strip())
+    if not compact:
+        return ""
+    return _truncate_state_value(compact)
+
+
+def _extract_open_loop(user_text: str, assistant_text: str) -> str:
+    if "?" in assistant_text or "？" in assistant_text:
+        return "assistant asked a follow-up question"
+    if _is_troubleshooting_text(user_text):
+        return "check whether the proposed fix resolved the issue"
+    return "continue current topic"
+
+
+def _build_delta_summary(turns: List[Dict[str, str]], scene_state: Dict[str, str]) -> str:
+    if not turns:
+        return "No prior turns."
+    recent = turns[-3:]
+    lines = [
+        f"mode={scene_state.get('mode', 'normal')}",
+        f"topic={scene_state.get('topic', 'general chat')}",
+        f"open_loop={scene_state.get('open_loop', 'continue current topic')}",
+    ]
+    for turn in recent:
+        user = _truncate_state_value(turn.get("user", ""))
+        assistant = _truncate_state_value(turn.get("assistant", ""))
+        lines.append(f"user: {user} / assistant: {assistant}")
+    return "\n".join(lines)
+
+
+def _truncate_state_value(text: str, limit: int = 120) -> str:
+    text = re.sub(r"\s+", " ", text.strip())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _should_recall_memory(user_text: str) -> bool:
+    normalized = re.sub(r"\s+", "", user_text.lower())
+    greeting_tokens = {
+        "こんにちは",
+        "こんばんは",
+        "おはよう",
+        "やあ",
+        "うっす",
+        "hello",
+        "hi",
+        "hey",
+    }
+    if normalized in greeting_tokens:
+        return False
+    return len(normalized) >= 6
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    return re.sub(r"[\s\u3000、。，．！？!?…\-ー]+", "", text.lower())
+
+
+def _is_repetitive_reply(candidate: str, previous_assistant: str) -> bool:
+    if not candidate or not previous_assistant:
+        return False
+    left = _normalize_for_repeat_check(candidate)
+    right = _normalize_for_repeat_check(previous_assistant)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if len(left) >= 12 and len(right) >= 12 and (left in right or right in left):
+        return True
+    return False
+
+
+def _is_user_echo(candidate: str, user_text: str) -> bool:
+    if not candidate or not user_text:
+        return False
+    left = _normalize_for_repeat_check(candidate)
+    right = _normalize_for_repeat_check(user_text)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter = min(len(left), len(right))
+    if shorter >= 10 and (left in right or right in left):
+        return True
+    return False
+
+
+def _looks_like_broken_dialogue(text: str) -> bool:
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered.count("...") >= 3 or lowered.count("…") >= 3:
+        return True
+    if text.count("ヤッチョ") >= 2:
+        return True
+    if re.search(r"(.{2,12}?)\1{2,}", text):
+        return True
+    return False
+
+
+def _build_nonrepetitive_reply(user_text: str) -> str:
+    text = user_text.strip()
+    if not text:
+        return ""
+    if len(text) <= 18:
+        return "その話、もう少しだけ続けて。"
+    return "そこはそのまま返すより、普通に続きを聞きたい。気になってるところから話して。"
+
+
+def _is_greeting_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    return normalized in {"こんにちは", "こんばんは", "おはよう", "やあ", "うっす", "hello", "hi", "hey"}
+
+
+def _strip_non_greeting_prefix(user_text: str, assistant_text: str) -> str:
+    if _is_greeting_text(user_text):
+        return assistant_text
+    return re.sub(r"^ヤオヨロー[！!。]?\s*", "", assistant_text).strip()
+
+
+def _needs_troubleshooting_repair(user_text: str, assistant_text: str) -> bool:
+    if not _is_troubleshooting_text(user_text):
+        return False
+    lowered = assistant_text.lower()
+    useful_markers = ("原因", "確認", "まず", "試", "押した", "通信", "ログ", "表示", "エラー")
+    if any(marker in assistant_text for marker in useful_markers):
+        return False
+    if lowered.startswith("ヤオヨロー") or "どうしましたか" in assistant_text or "教えてくれないかな" in assistant_text:
+        return True
+    return True
+
+
+def _build_troubleshooting_reply(user_text: str) -> str:
+    if "スマホ" in user_text and "送信" in user_text:
+        return "送信イベントか通信経路のどちらかで止まっていそう。まずは押した直後にステータス表示かネットワークリクエストが動くか見て。"
+    if "時刻" in user_text:
+        return "時刻そのものより、時刻取得を呼ぶ条件分岐が誤作動していそう。まずは時刻系キーワードで別処理に入っていないか見て。"
+    return "原因候補は入力処理か通信処理のどちらかだね。まずは直前の操作と、画面に出ている表示を一つずつ確認しよう。"
+
+
+def _needs_casual_repair(user_text: str, assistant_text: str) -> bool:
+    if _is_troubleshooting_text(user_text) or _is_greeting_text(user_text):
+        return False
+    casual_markers = ("疲れた", "しんどい", "だるい", "眠い", "ひま", "なんか")
+    if not any(marker in user_text for marker in casual_markers):
+        return False
+    if "？" in assistant_text or "?" in assistant_text:
+        return True
+    if assistant_text.startswith("ヤオヨロー"):
+        return True
+    return False
+
+
+def _build_casual_reply(user_text: str) -> str:
+    if "疲れた" in user_text or "しんどい" in user_text:
+        return "それはきついな。今日は無理にがんばらず、だらっと話すくらいでいいよ。"
+    if "だるい" in user_text or "眠い" in user_text:
+        return "それはもう休み寄りでいこう。重い話は後回しでもいい。"
+    if "ひま" in user_text:
+        return "じゃあ軽く話そう。思いついたことをそのまま投げてくれればいいよ。"
+    return "まあそういう日もある。気楽に続けよう。"
+
+
+def _emit_text_chunks(text: str, size: int = 24) -> List[str]:
+    if not text:
+        return []
+    return [text[index : index + size] for index in range(0, len(text), size)]
 
 
 def _packet(event_type: str, payload: object) -> ControlPacket:
