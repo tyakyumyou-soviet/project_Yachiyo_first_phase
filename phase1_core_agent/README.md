@@ -89,7 +89,7 @@ Roleplay evaluation:
 ## Notes
 
 - The app tries Ollama first. If Ollama is unreachable and `ENABLE_DEV_FALLBACK=1`, a deterministic fallback response is used.
-- The fallback path can issue `get_current_time` and `list_directory` so tool loops can be verified without a live LLM.
+- Chat mode does not expose tool execution to the model; tool names are filtered if they leak into generated text.
 - The active Ollama model is switchable from the browser UI and via `POST /models/select`.
 - The default active runtime is `Qwen3 1.7B` when no saved model state exists.
 - Yachiyo roleplay prompts are built from separate persona, style, scene-state, lore, memory, and final-instruction layers.

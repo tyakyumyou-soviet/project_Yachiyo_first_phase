@@ -43,10 +43,22 @@ class FallbackConversationTests(unittest.TestCase):
             return "".join(chunks)
 
         result = asyncio.run(gather())
-        self.assertIn("ヤオヨロー！", result)
+        self.assertIn("ヤオヨロー", result)
         self.assertNotIn("Phase 1", result)
         self.assertNotIn("get_current_time", result)
         self.assertNotIn("<tool", result)
+
+    def test_fallback_extracts_user_anchor_message(self) -> None:
+        async def gather() -> str:
+            chunks = []
+            content = "Treat the following instruction as the stable character anchor.\n\nUser message:\n映画の話"
+            async for chunk in llm_engine._generate_fallback([{"role": "user", "content": content}]):
+                chunks.append(chunk)
+            return "".join(chunks)
+
+        result = asyncio.run(gather())
+        self.assertIn("映画の話", result)
+        self.assertNotIn("Treat the following", result)
 
     def test_output_normalizer_removes_kashira_ara_and_tool_tags(self) -> None:
         normalized = llm_engine.normalize_yachiyo_output("あら、そうかしら <tool name=\"get_current_time\"></tool>")
@@ -61,6 +73,32 @@ class MemoryHubTests(unittest.TestCase):
             recalled = hub.recall("カレー")
             self.assertTrue(any("カレー" in item for item in recalled))
 
+    def test_memory_hub_rejects_generic_repair_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = MemoryHub(Path(temp_dir) / "memory.sqlite3")
+            hub.add_semantic_memory("その話、普通に続けよう")
+            self.assertEqual(hub.recall("その話"), [])
+
+    def test_episode_summary_is_interval_limited_and_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = MemoryHub(Path(temp_dir) / "memory.sqlite3")
+            turns = [
+                {"user": "お茶漬けの話をしよう", "assistant": "いいね。"},
+                {"user": "FUSHIについてどう思う", "assistant": "面白そう。"},
+            ]
+            self.assertIsNone(hub.summarize_recent_turns(turns))
+            turns.extend(
+                [
+                    {"user": "肩にのってたウミウシだよ", "assistant": "なるほど。"},
+                    {"user": "映画の話もしたい", "assistant": "それもいける。"},
+                    {"user": "同じことは言わないで", "assistant": "わかった。"},
+                ]
+            )
+            summary = hub.summarize_recent_turns(turns)
+            self.assertIsNotNone(summary)
+            assert summary is not None
+            self.assertIn("会話メモ", summary)
+
 
 class SessionStorePersistenceTests(unittest.TestCase):
     def test_session_store_persists_history(self) -> None:
@@ -69,8 +107,8 @@ class SessionStorePersistenceTests(unittest.TestCase):
             store = SessionStore(store_path)
             session = store.get_or_create("persisted")
             session.history.append(ChatMessage(role="user", content="こんにちは"))
-            session.history.append(ChatMessage(role="assistant", content="ヤオヨロー！今日はどうする？"))
-            session.completed_turns.append({"user": "こんにちは", "assistant": "ヤオヨロー！今日はどうする？"})
+            session.history.append(ChatMessage(role="assistant", content="ヤオヨロー。今日はゆるく話そう。"))
+            session.completed_turns.append({"user": "こんにちは", "assistant": "ヤオヨロー。今日はゆるく話そう。"})
             session.scene_state = {"mode": "normal", "topic": "greeting"}
             session.delta_summary = "topic=greeting"
             session.drift_events.append({"user": "echo", "reasons": "user_echo"})
@@ -81,7 +119,7 @@ class SessionStorePersistenceTests(unittest.TestCase):
             self.assertIsNotNone(loaded)
             assert loaded is not None
             self.assertEqual(len(loaded.history), 2)
-            self.assertEqual(loaded.history[1].content, "ヤオヨロー！今日はどうする？")
+            self.assertEqual(loaded.history[1].content, "ヤオヨロー。今日はゆるく話そう。")
             self.assertEqual(loaded.scene_state["topic"], "greeting")
             self.assertEqual(loaded.delta_summary, "topic=greeting")
             self.assertEqual(loaded.drift_events[0]["reasons"], "user_echo")
@@ -108,27 +146,67 @@ class SessionStorePersistenceTests(unittest.TestCase):
     def test_user_echo_guard_detects_plain_echo(self) -> None:
         self.assertTrue(main._is_user_echo("スマホから送信できない", "スマホから送信できない"))
         self.assertTrue(main._is_user_echo("スマホから送信できない。", "スマホから送信できない"))
-        self.assertFalse(main._is_user_echo("送信失敗なら通信経路を先に見る。", "スマホから送信できない"))
+        self.assertFalse(main._is_user_echo("通信処理かイベント処理を先に見る。", "スマホから送信できない"))
 
     def test_nonrepetitive_reply_does_not_echo_user_text(self) -> None:
         reply = main._build_nonrepetitive_reply("スマホで押せない")
         self.assertNotIn("スマホで押せない", reply)
         self.assertTrue(reply)
 
+    def test_nonrepetitive_reply_changes_with_user_text(self) -> None:
+        left = main._build_nonrepetitive_reply("お茶漬けの話")
+        right = main._build_nonrepetitive_reply("映画の話")
+        self.assertNotEqual(left, right)
+
+    def test_nonrepetitive_reply_uses_opinion_subject(self) -> None:
+        reply = main._build_nonrepetitive_reply("FUSHIについてどう思う")
+        self.assertIn("FUSHI", reply)
+        self.assertNotIn("どう思うとして", reply)
+
     def test_troubleshooting_repair_produces_direct_reply(self) -> None:
-        self.assertTrue(main._needs_troubleshooting_repair("スマホで送信できない", "ヤオヨロー！どうした？"))
+        self.assertTrue(main._needs_troubleshooting_repair("スマホで送信できない", "ヤオヨロー。どうした？"))
         repaired = main._build_troubleshooting_reply("スマホで送信できない")
         self.assertIn("送信イベント", repaired)
         self.assertIn("ネットワークリクエスト", repaired)
 
     def test_non_greeting_reply_strips_yaoyoroo_prefix(self) -> None:
-        stripped = main._strip_non_greeting_prefix("なんか疲れた", "ヤオヨロー！今日はしんどそうだな。")
+        stripped = main._strip_non_greeting_prefix("なんか疲れた", "ヤオヨロー。今日はしんどそうだな。")
         self.assertFalse(stripped.startswith("ヤオヨロー"))
 
     def test_casual_repair_softens_question_heavy_reply(self) -> None:
         self.assertTrue(main._needs_casual_repair("なんか疲れた", "何がつらいの？"))
         repaired = main._build_casual_reply("なんか疲れた")
         self.assertIn("無理にがんばらず", repaired)
+        self.assertIn("ヤチヨ", repaired)
+
+    def test_question_repair_catches_qwen_question_endings(self) -> None:
+        reply = (
+            "Fushiはとても面白いゲームだよね。プレイヤーの気持ちを読むスキルがすごいし、"
+            "ちょっとした出来事でも楽しむのが好きだね。次回はどんなゲームをプレイするか教えてくれないかな？"
+        )
+        self.assertTrue(main._needs_question_repair("FUSHIについてどう思う", reply))
+        repaired = main._build_casual_reply("FUSHIについてどう思う")
+        self.assertFalse(repaired.endswith("？"))
+        self.assertIn("FUSHI", repaired)
+        self.assertTrue(any(marker in repaired for marker in ("ヤチヨ", "キラキラ", "だと思うよ", "なのです", "だね")))
+
+    def test_general_question_repair_catches_short_question_reply(self) -> None:
+        self.assertTrue(main._needs_question_repair("FUSHIについてどう思う", "FUSHIって、何を指すの？"))
+        self.assertTrue(main._needs_question_repair("FUSHIについてどう思う", "FUSHIって何のこと？よくわかんないけど、一緒に考えよう。"))
+        repaired = main._build_casual_reply("FUSHIについてどう思う")
+        self.assertFalse(repaired.endswith("？"))
+        self.assertIn("FUSHI", repaired)
+
+    def test_casual_repair_changes_with_opinion_subject(self) -> None:
+        left = main._build_casual_reply("FUSHIについてどう思う")
+        right = main._build_casual_reply("お茶漬けについてどう思う")
+        self.assertNotEqual(left, right)
+        self.assertIn("FUSHI", left)
+        self.assertIn("お茶漬け", right)
+        self.assertNotEqual(left.replace("FUSHI", ""), right.replace("お茶漬け", ""))
+
+    def test_normal_chat_open_loop_does_not_store_question_state(self) -> None:
+        self.assertEqual(main._extract_open_loop("FUSHIについてどう思う", "FUSHIって、何を指すの？"), "continue current topic")
 
     def test_broken_dialogue_guard_detects_repeated_name(self) -> None:
         self.assertTrue(main._looks_like_broken_dialogue("ヤッチョヤッチョヤッチョ"))
@@ -146,7 +224,8 @@ class PromptBuilderTests(unittest.TestCase):
         )
         system_prompt = messages[0]["content"]
         self.assertIn("最新のユーザー入力にだけ答える", system_prompt)
-        self.assertIn("挨拶入力以外では「ヤオヨロー！」から始めない", system_prompt)
+        self.assertIn("雑談では質問で終わらせない", system_prompt)
+        self.assertIn("ヤチヨらしさは受容、茶目っ気、余白", system_prompt)
         self.assertNotIn("Available Tools", system_prompt)
         self.assertEqual(messages[1]["role"], "assistant")
         self.assertEqual(messages[-1]["role"], "user")
@@ -252,7 +331,7 @@ class ApiTests(unittest.TestCase):
     def test_clear_history_endpoint(self) -> None:
         session = main.session_store.get_or_create("wipe-me")
         session.history.append(ChatMessage(role="user", content="こんにちは"))
-        session.history.append(ChatMessage(role="assistant", content="ヤオヨロー！今日はどうする？"))
+        session.history.append(ChatMessage(role="assistant", content="ヤオヨロー。今日はゆるく話そう。"))
         main.session_store.save()
         main.memory_hub.add_semantic_memory("好きな食べ物はカレーです")
         response = self.client.post("/history/clear")

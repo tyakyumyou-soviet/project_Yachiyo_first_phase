@@ -24,7 +24,7 @@ FORBIDDEN_FRAGMENTS = (
 
 
 def normalize_for_compare(text: str) -> str:
-    return re.sub(r"[\s\u3000、。・…\-\"'「」『』()]+", "", text.lower())
+    return re.sub(r"[\s\u3000、。，．！？!?…\-ー\"'「」『』（）()]+", "", text.lower())
 
 
 def detect_drift(reply: str, *, user_text: str = "", previous_reply: str = "") -> DriftReport:
@@ -71,9 +71,13 @@ def build_recovery_instruction(user_text: str, reasons: List[str]) -> str:
 
 
 def safe_recovery_reply(user_text: str) -> str:
-    if len(user_text.strip()) <= 18:
-        return "その話題で答える。知りたい点を一つだけ言って。"
-    return "その話題で続けられる。いま一番答えてほしい点を一つに絞って。"
+    cleaned = re.sub(r"\s+", " ", user_text.strip(" 　、。！？!?"))
+    if not cleaned:
+        return "返答が崩れたから、いったん普通の会話に戻す。"
+    if len(cleaned) <= 18:
+        return f"{cleaned}の話として受け取る。変な返しは捨てて続ける。"
+    topic = cleaned[:27].rstrip() + "..." if len(cleaned) > 28 else cleaned
+    return f"{topic}の文脈で返し直す。さっきの崩れた返答は使わない。"
 
 
 def _has_repeated_ngrams(text: str) -> bool:

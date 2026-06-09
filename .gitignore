@@ -15,6 +15,7 @@ env/
 
 # Local runtime data
 phase1_core_agent/data/*.sqlite3
+phase1_core_agent/data/sessions.json
 phase1_core_agent/data/model_switch_verification.json
 phase1_core_agent/data/ten_rally_demo*.json
 phase1_core_agent/data/ten_rally_demo*.md

@@ -419,7 +419,7 @@ def _app_shell_html() -> str:
       </div>
       <div class="log" id="log"></div>
       <div class="composer">
-        <textarea id="prompt" placeholder="たとえば: ヤオヨロー！今の時刻だけ短く教えて"></textarea>
+        <textarea id="prompt" placeholder="メッセージを入力"></textarea>
         <div class="row">
           <button id="send" type="button">送信</button>
           <span class="tiny">Shift+Enterで改行 / Enterで送信</span>
@@ -742,8 +742,8 @@ async def stream_chat_turn(session: ChatSession, user_text: str) -> AsyncGenerat
     assistant_text = _strip_non_greeting_prefix(user_text, assistant_text)
     if _needs_troubleshooting_repair(user_text, assistant_text):
         assistant_text = _build_troubleshooting_reply(user_text)
-    if _needs_casual_repair(user_text, assistant_text):
-        assistant_text = _build_casual_reply(user_text)
+    if _needs_casual_repair(user_text, assistant_text) or _needs_question_repair(user_text, assistant_text):
+        assistant_text = _build_casual_reply(user_text, previous_assistant=previous_assistant)
     for chunk in _emit_text_chunks(assistant_text):
         yield _packet("text_chunk", chunk)
     session.history.append(ChatMessage(role="user", content=user_text))
@@ -793,7 +793,7 @@ def _extract_topic(text: str) -> str:
 
 
 def _extract_open_loop(user_text: str, assistant_text: str) -> str:
-    if "?" in assistant_text or "？" in assistant_text:
+    if _is_troubleshooting_text(user_text) and ("?" in assistant_text or "？" in assistant_text):
         return "assistant asked a follow-up question"
     if _is_troubleshooting_text(user_text):
         return "check whether the proposed fix resolved the issue"
@@ -890,9 +890,16 @@ def _build_nonrepetitive_reply(user_text: str) -> str:
     text = user_text.strip()
     if not text:
         return ""
+    opinion_subject = _extract_opinion_subject(text)
+    if opinion_subject:
+        return f"{opinion_subject}の話として受け取る。さっきの返しは捨てて、今の文脈から返す。"
     if len(text) <= 18:
-        return "その話、もう少しだけ続けて。"
-    return "そこはそのまま返すより、普通に続きを聞きたい。気になってるところから話して。"
+        if _is_troubleshooting_text(text):
+            return "入力か通信のどちらかで見直す。さっきと同じ返しにはしない。"
+        topic = _short_topic_label(text)
+        return f"{topic}として受け取る。さっきと同じ返しにはしない。"
+    topic = _short_topic_label(text)
+    return f"{topic}の話として受け取る。さっきの返しは捨てて、今の文脈から返す。"
 
 
 def _is_greeting_text(text: str) -> bool:
@@ -939,14 +946,94 @@ def _needs_casual_repair(user_text: str, assistant_text: str) -> bool:
     return False
 
 
-def _build_casual_reply(user_text: str) -> str:
+def _needs_question_repair(user_text: str, assistant_text: str) -> bool:
+    if _is_troubleshooting_text(user_text) or _is_greeting_text(user_text):
+        return False
+    question_count = assistant_text.count("？") + assistant_text.count("?")
+    if question_count >= 1 and assistant_text.rstrip().endswith(("？", "?")):
+        return True
+    if question_count >= 2:
+        return True
+    questiony_phrases = (
+        "何かな",
+        "どうした",
+        "どういうこと",
+        "何を指す",
+        "何のこと",
+        "どんな感じ",
+        "教えて",
+        "教えてくれ",
+        "次回は",
+        "どんな",
+    )
+    return any(phrase in assistant_text for phrase in questiony_phrases) and question_count >= 1
+
+
+def _build_casual_reply(user_text: str, previous_assistant: str = "") -> str:
     if "疲れた" in user_text or "しんどい" in user_text:
-        return "それはきついな。今日は無理にがんばらず、だらっと話すくらいでいいよ。"
+        return _avoid_exact_repeat("それはしんどいね。今日は無理にがんばらず、だらっと話すくらいでいいよ、ヤチヨ的には。", previous_assistant)
     if "だるい" in user_text or "眠い" in user_text:
-        return "それはもう休み寄りでいこう。重い話は後回しでもいい。"
+        return _avoid_exact_repeat("それはもう休み寄りでいこう。重い話は後回しでもいいよ、よしよし。", previous_assistant)
     if "ひま" in user_text:
-        return "じゃあ軽く話そう。思いついたことをそのまま投げてくれればいいよ。"
-    return "まあそういう日もある。気楽に続けよう。"
+        return _avoid_exact_repeat("じゃあ軽く話そう。思いついたことをそのまま投げてくれればいいよ、ヤッチョは聞くのです。", previous_assistant)
+    if "についてどう思う" in user_text or "どう思う" in user_text:
+        subject = _extract_opinion_subject(user_text)
+        return _avoid_exact_repeat(_opinion_repair_reply(subject or "その話"), previous_assistant)
+    if len(user_text.strip()) <= 18:
+        topic = _short_topic_label(user_text)
+        suffix = "" if topic.endswith("話") else "の話"
+        return _avoid_exact_repeat(f"{topic}{suffix}でいこう。短くても、そこから普通に続けられる。", previous_assistant)
+    topic = _short_topic_label(user_text)
+    return _avoid_exact_repeat(_topic_repair_reply(topic), previous_assistant)
+
+
+def _extract_opinion_subject(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text.strip())
+    compact = re.sub(r"[？?。！!]+$", "", compact)
+    for suffix in ("についてどう思う", "をどう思う", "どう思う"):
+        if suffix in compact:
+            subject = compact.split(suffix, 1)[0].strip(" 　、。")
+            return _short_topic_label(subject)
+    return ""
+
+
+def _short_topic_label(text: str, limit: int = 28) -> str:
+    cleaned = re.sub(r"\s+", " ", text.strip(" 　、。！？!?"))
+    if not cleaned:
+        return "その話"
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "..."
+
+
+def _opinion_repair_reply(subject: str) -> str:
+    variants = [
+        f"{subject}は、今の材料だけだと断定しにくいけど、まずは引っかかりのある題材だと思うよ。",
+        f"{subject}は名前だけでも少し気になる。ヤチヨ的には、軽く掘る価値はありそう。",
+        f"{subject}はまだ輪郭が薄いけど、話の中で育てるには悪くない題材だと思う。ちょっとキラキラしてるね。",
+    ]
+    return variants[_stable_variant(subject, len(variants))]
+
+
+def _topic_repair_reply(topic: str) -> str:
+    variants = [
+        f"{topic}として受け取ったよ。大げさにせず、その流れで普通に話そう。",
+        f"{topic}の方向でいこう。無理にまとめず、今の流れを優先するのです。",
+        f"{topic}なら、そのまま続けられるね。変に質問攻めにはしないよ。",
+    ]
+    return variants[_stable_variant(topic, len(variants))]
+
+
+def _stable_variant(text: str, size: int) -> int:
+    if size <= 1:
+        return 0
+    return sum(ord(char) for char in text) % size
+
+
+def _avoid_exact_repeat(candidate: str, previous_assistant: str) -> str:
+    if not previous_assistant or not _is_repetitive_reply(candidate, previous_assistant):
+        return candidate
+    return "同じ返しになっていた。今の入力に合わせて、返答を組み直す。"
 
 
 def _emit_text_chunks(text: str, size: int = 24) -> List[str]:

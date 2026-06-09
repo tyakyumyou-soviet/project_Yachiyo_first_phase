@@ -60,15 +60,10 @@
       background: rgba(255, 255, 255, 0.03);
     }
 
-    .brand {
-      min-width: 0;
-    }
-
     .brand h1 {
       margin: 0;
       font-size: 18px;
       line-height: 1.2;
-      letter-spacing: 0;
     }
 
     .brand p {
@@ -313,11 +308,11 @@
       <div class="composer-shell">
         <textarea id="prompt" placeholder="メッセージを入力"></textarea>
         <div class="composer-row">
-          <span class="hint">Enter to send / Shift+Enter for newline</span>
+          <span class="hint">Enterで送信 / Shift+Enterで改行</span>
           <div class="composer-actions">
             <select class="model-select" id="model-select" aria-label="Model"></select>
             <button class="button-secondary" id="clear-history" type="button">履歴削除</button>
-            <button id="send" type="button">Send</button>
+            <button id="send" type="button">送信</button>
           </div>
         </div>
       </div>
@@ -361,7 +356,6 @@
       if (window.crypto && typeof window.crypto.randomUUID === "function") {
         return window.crypto.randomUUID();
       }
-
       const randomPart = Math.random().toString(36).slice(2);
       return `session-${Date.now().toString(36)}-${randomPart}`;
     }
@@ -464,7 +458,7 @@
         body: JSON.stringify({ model_id: nextModelId }),
       });
       if (!response.ok) {
-        appendBubble("system", "Model switch failed.");
+        appendBubble("system", "モデル切り替えに失敗しました。");
         await refreshModels();
         setStatus("ready", true);
         return;

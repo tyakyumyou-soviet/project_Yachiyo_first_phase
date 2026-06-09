@@ -29,8 +29,7 @@ class LLMEngineError(RuntimeError):
 def user_visible_llm_failure_message(detail: str) -> str:
     active_model = get_active_model_name()
     return (
-        "モデルの応答をうまく受け取れませんでした。"
-        " 少し待ってから、もう一度だけ短く聞いてください。\n"
+        "モデルの応答をうまく受け取れませんでした。少し待ってから、もう一度送ってください。\n"
         f"現在のモデル: {active_model}\n"
         f"詳細: {detail}"
     )
@@ -203,7 +202,7 @@ def _looks_like_failed_response(text: str) -> bool:
 
 
 def _short_reply(messages: List[Dict[str, str]]) -> str | None:
-    user_text = messages[-1]["content"].strip() if messages else ""
+    user_text = _latest_user_text(messages)
     normalized = re.sub(r"\s+", "", user_text.lower())
     greeting_tokens = {
         "こんにちは",
@@ -216,7 +215,7 @@ def _short_reply(messages: List[Dict[str, str]]) -> str | None:
         "hey",
     }
     if normalized in greeting_tokens:
-        return "ヤオヨロー！今日はどうする？"
+        return "ヤオヨロー。今日はゆるく話そう。"
     return None
 
 
@@ -225,18 +224,80 @@ async def _generate_fallback(messages: List[Dict[str, str]]) -> AsyncGenerator[s
 
 
 def _fallback_conversation(messages: List[Dict[str, str]]) -> str:
-    user_text = messages[-1]["content"] if messages else ""
+    user_text = _latest_user_text(messages)
     lowered = user_text.lower()
     if any(keyword in lowered for keyword in ("send", "failed", "error", "bug")) or any(
         keyword in user_text for keyword in ("送信", "失敗", "エラー", "できない", "動かない", "壊れ")
     ):
-        return "原因を一つずつ切ろう。いま出ている表示と、押した直後の挙動を短く教えて。"
+        return "原因を一つずつ切り分けよう。いま出ている表示と、押した直後の挙動を見れば進められる。"
     compact = re.sub(r"\s+", "", user_text.lower())
     if compact in {"こんにちは", "こんばんは", "おはよう", "やあ", "うっす", "hello", "hi", "hey"}:
-        return "ヤオヨロー！今日はどうする？"
+        return "ヤオヨロー。今日はゆるく話そう。"
+    opinion_subject = _extract_opinion_subject(user_text)
+    if opinion_subject:
+        return _opinion_fallback_reply(opinion_subject)
     if len(user_text.strip()) <= 18:
-        return "それ、もう少しだけ聞かせて。"
-    return "それなら普通に話せるよ。気になってるところから続けて。"
+        topic = user_text.strip(" 　、。！？!?") or "その話"
+        suffix = "" if topic.endswith("話") else "の話"
+        return f"{topic}{suffix}でいこう。普通に続けられる。"
+    topic = re.sub(r"\s+", " ", user_text.strip(" 　、。！？!?"))
+    if len(topic) > 28:
+        topic = topic[:27].rstrip() + "..."
+    return _topic_fallback_reply(topic)
+
+
+def _latest_user_text(messages: List[Dict[str, str]]) -> str:
+    if not messages:
+        return ""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = str(message.get("content", ""))
+            return _extract_embedded_user_message(content)
+    return _extract_embedded_user_message(str(messages[-1].get("content", "")))
+
+
+def _extract_embedded_user_message(content: str) -> str:
+    markers = ("User message:\n", "最新のユーザー入力:\n")
+    for marker in markers:
+        if marker in content:
+            return content.rsplit(marker, 1)[-1].strip()
+    return content.strip()
+
+
+def _extract_opinion_subject(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text.strip())
+    compact = re.sub(r"[？?。！!]+$", "", compact)
+    for suffix in ("についてどう思う", "をどう思う", "どう思う"):
+        if suffix in compact:
+            subject = compact.split(suffix, 1)[0].strip(" 　、。")
+            if len(subject) > 28:
+                return subject[:27].rstrip() + "..."
+            return subject
+    return ""
+
+
+def _opinion_fallback_reply(subject: str) -> str:
+    variants = [
+        f"{subject}は、まだ断定せずに見たい題材だと思う。",
+        f"{subject}は少し気になる。軽く掘る価値はありそう。",
+        f"{subject}は話の中で輪郭が出てきそうな感じがある。",
+    ]
+    return variants[_stable_variant(subject, len(variants))]
+
+
+def _topic_fallback_reply(topic: str) -> str:
+    variants = [
+        f"{topic}として受け取った。大げさにせず、その流れで話そう。",
+        f"{topic}の方向でいこう。無理にまとめず普通に続ける。",
+        f"{topic}なら、そのまま続けられる。質問攻めにはしない。",
+    ]
+    return variants[_stable_variant(topic, len(variants))]
+
+
+def _stable_variant(text: str, size: int) -> int:
+    if size <= 1:
+        return 0
+    return sum(ord(char) for char in text) % size
 
 
 def _chunk_text(text: str, size: int = 24) -> List[str]:

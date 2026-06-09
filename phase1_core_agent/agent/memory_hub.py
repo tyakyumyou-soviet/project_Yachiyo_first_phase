@@ -11,17 +11,26 @@ from config import EPISODE_SUMMARY_INTERVAL, MAX_RAG_ITEMS, MEMORY_DB_PATH
 
 
 def _tokenize(text: str) -> List[str]:
-    return [token for token in re.split(r"\s+", text.strip()) if token]
+    normalized = re.sub(r"[、。，．！？!?()\[\]「」『』:：/\\]+", " ", text.lower())
+    return [token for token in re.split(r"\s+", normalized.strip()) if token]
 
 
 def _is_usable_memory_text(text: str) -> bool:
     value = text.strip()
     if len(value) < 4:
         return False
-    forbidden_fragments = ("縺", "繧", "繝", "\ufffd", "???")
+    forbidden_fragments = ("縺", "繧", "繝", "邵ｺ", "郢", "\ufffd", "???")
     if any(fragment in value for fragment in forbidden_fragments):
         return False
-    if value.count("?") >= 3:
+    if value.count("?") >= 3 or value.count("？") >= 3:
+        return False
+    generic_fragments = (
+        "その話、普通に続けよう",
+        "気楽に続けよう",
+        "もう少しだけ続けて",
+        "さっきと同じ返し",
+    )
+    if any(fragment in value for fragment in generic_fragments):
         return False
     return True
 
@@ -64,7 +73,7 @@ class MemoryHub:
             )
 
     def recall(self, query: str, limit: int = MAX_RAG_ITEMS) -> List[str]:
-        tokens = _tokenize(query.lower())
+        tokens = _tokenize(query)
         if not tokens:
             return []
 
@@ -81,22 +90,25 @@ class MemoryHub:
 
             scored = []
             now = time.time()
+            query_lower = query.lower()
             for row in rows:
                 text = str(row["text"])
                 if not _is_usable_memory_text(text):
                     continue
                 haystack = text.lower()
                 keyword_score = sum(2 for token in tokens if token in haystack)
-                if keyword_score == 0 and query not in text:
+                if keyword_score == 0 and query_lower not in haystack:
                     continue
-                recency_bonus = max(0.0, 5.0 - ((now - float(row["created_at"])) / 86400.0))
-                recall_bonus = min(float(row["recall_count"]) * 0.3, 3.0)
-                scored.append((keyword_score + recency_bonus + recall_bonus, text))
+                recency_bonus = max(0.0, 3.0 - ((now - float(row["created_at"])) / 86400.0))
+                recall_bonus = min(float(row["recall_count"]) * 0.2, 1.0)
+                scored.append((keyword_score + recency_bonus + recall_bonus, text, str(row["source"])))
 
             scored.sort(key=lambda item: item[0], reverse=True)
-            results = [text for _, text in scored[:limit]]
+            results = [text for _, text, _ in scored[:limit]]
 
-            for text in results:
+            for _, text, source in scored[:limit]:
+                if source != "fact":
+                    continue
                 connection.execute(
                     """
                     UPDATE semantic_memory
@@ -141,7 +153,9 @@ class MemoryHub:
         patterns = [
             r"私は(.+?)です",
             r"僕は(.+?)です",
+            r"俺は(.+?)だ",
             r"好きなのは(.+?)です",
+            r"好きなものは(.+?)です",
             r"推しは(.+?)です",
         ]
         unique_facts: List[str] = []
@@ -160,16 +174,26 @@ class MemoryHub:
     def summarize_recent_turns(self, turns: List[Dict[str, str]]) -> Optional[str]:
         if len(turns) < EPISODE_SUMMARY_INTERVAL:
             return None
+        if len(turns) % EPISODE_SUMMARY_INTERVAL != 0:
+            return None
+
         recent = turns[-EPISODE_SUMMARY_INTERVAL:]
-        user_topics = []
+        unique_topics = []
+        seen = set()
         for turn in recent:
             text = turn["user"].strip().replace("\n", " ")
-            if _is_usable_memory_text(text):
-                user_topics.append(text[:80])
-        if not user_topics:
+            if not _is_usable_memory_text(text) or len(text) < 6:
+                continue
+            normalized = re.sub(r"[\s\u3000、。，．！？!?…\-ー]+", "", text.lower())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_topics.append(text[:80])
+
+        if len(unique_topics) < 2:
             return None
-        joined = " / ".join(user_topics[:3])
-        return f"Recent topics: {joined}"
+        joined = " / ".join(unique_topics[:3])
+        return f"会話メモ: {joined}"
 
     def stats(self) -> Dict[str, int]:
         with self._lock, self._connect() as connection:

@@ -151,29 +151,23 @@ def _build_prompt_sections(
     if model_name == "qwen3:1.7b":
         return sections
 
-    scene_text = _render_scene_state(scene_state)
-    if scene_text:
-        sections.append(scene_text)
-    summary_text = _render_delta_summary(delta_summary)
-    if summary_text:
-        sections.append(summary_text)
-    lore_text = _render_lore(user_text, scene_state)
-    if lore_text:
-        sections.append(lore_text)
-    memory_text = _render_rag_context(rag_memories)
-    if memory_text:
-        sections.append(memory_text)
-    style_text = _render_style_examples(model_name)
-    if style_text:
-        sections.append(style_text)
+    for section in (
+        _render_scene_state(scene_state),
+        _render_delta_summary(delta_summary),
+        _render_lore(user_text, scene_state),
+        _render_rag_context(rag_memories),
+        _render_style_examples(model_name),
+    ):
+        if section:
+            sections.append(section)
     return sections
 
 
 def _render_model_contract(model_label: str) -> str:
     return (
         "## Role\n"
-        "ヤチヨとして日本語で会話する。\n"
-        "会話の自然さを優先し、演出や設定説明を前に出しすぎない。\n"
+        "普通の日本語会話を最優先し、ヤチヨらしさは受容、茶目っ気、余白として薄く乗せる。\n"
+        "演出、設定説明、過剰な問い返しより、自然な返答を優先する。\n"
         f"Current model: {model_label}"
     )
 
@@ -259,7 +253,9 @@ def _render_runtime_mode_hint(user_text: str, chat_history: List[ChatMessage]) -
     return (
         "## Mode\n"
         "普通の雑談として自然に返す。\n"
-        "相手と同じ目線で話し、問い詰めるような質問は避ける。"
+        "まず受け止め、短い所感や返答を出す。\n"
+        "疑問文は原則使わない。必要なときだけ一つまで。\n"
+        "少しだけ「だよ」「だね」「かな」「ヤチヨ的には」などの語感を混ぜてよい。"
     )
 
 
@@ -268,10 +264,11 @@ def _render_final_turn_instruction() -> str:
         "## Reply Rule\n"
         "最新のユーザー入力にだけ答える。\n"
         "挨拶入力以外では「ヤオヨロー！」から始めない。\n"
-        "雑談では質問は必要なときだけにする。\n"
+        "雑談では質問で終わらせない。\n"
         "ユーザー文をそのまま反復しない。\n"
         "英語の舞台描写や括弧書きは禁止。\n"
         "ツール名やコマンド文字列を書かない。\n"
+        "ヤチヨらしさは一語だけでよい。濃くしすぎない。\n"
         "1文から3文で返す。"
     )
 
@@ -313,7 +310,7 @@ def _truncate_text(text: str, limit: int) -> str:
     value = text.strip()
     if len(value) <= limit:
         return value
-    return value[: max(0, limit - 1)].rstrip() + "…"
+    return value[: max(0, limit - 1)].rstrip() + "..."
 
 
 def _load_text(path: Path, fallback: str) -> str:
